@@ -9,11 +9,11 @@ import { Upload, Trash2, RefreshCw, FileText, ChevronLeft, Search, Filter } from
 export default function AdminDocuments() {
   const { user, loading } = useAuth();
   const router = useRouter();
-  const [docs, setDocs]         = useState<Document[]>([]);
-  const [cats, setCats]         = useState<Category[]>([]);
-  const [total, setTotal]       = useState(0);
-  const [page, setPage]         = useState(1);
-  const [search, setSearch]     = useState('');
+  const [docs, setDocs] = useState<Document[]>([]);
+  const [cats, setCats] = useState<Category[]>([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(1);
+  const [search, setSearch] = useState('');
   const [catFilter, setCatFilter] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
   const [uploading, setUploading] = useState(false);
@@ -85,7 +85,7 @@ export default function AdminDocuments() {
       <div className="max-w-6xl mx-auto px-6 py-6">
         <div className="flex items-center gap-3 mb-6">
           <Link href="/admin" className="text-gray-400 hover:text-gray-600"><ChevronLeft className="w-5 h-5" /></Link>
-          <h1 className="text-xl font-bold text-gray-900">Documents</h1>
+          <h1 className="text-xl font-bold text-gray-200">Documents</h1>
           <span className="text-gray-400 text-sm ml-1">{total} total</span>
           <button onClick={() => setShowUpload(!showUpload)} className="btn-primary ml-auto flex items-center gap-2 text-sm">
             <Upload className="w-4 h-4" />Upload document
@@ -95,7 +95,7 @@ export default function AdminDocuments() {
         {/* Upload form */}
         {showUpload && (
           <div className="card p-5 mb-6">
-            <h2 className="font-semibold text-gray-800 mb-4 text-sm">Upload new document</h2>
+            <h2 className="font-semibold text-gray-200 mb-4 text-sm">Upload new document</h2>
             <form onSubmit={handleUpload} className="grid grid-cols-1 md:grid-cols-3 gap-4">
               <div>
                 <label className="text-xs text-gray-500 mb-1 block">Title (optional)</label>
@@ -160,18 +160,18 @@ export default function AdminDocuments() {
             </thead>
             <tbody className="divide-y divide-gray-100">
               {docs.map(doc => (
-                <tr key={doc.id} className="hover:bg-gray-50">
+                <tr key={doc.id} className="hover:bg-white/10 hover:shadow-sm">
                   <td className="px-4 py-3">
                     <div className="flex items-center gap-2">
                       <FileText className="w-4 h-4 text-gray-400 flex-shrink-0" />
                       <div>
-                        <p className="font-medium text-gray-900">{doc.title}</p>
+                        <p className="font-medium text-gray-100">{doc.title}</p>
                         <p className="text-xs text-gray-400">{doc.original_filename}</p>
                       </div>
                     </div>
                   </td>
-                  <td className="px-4 py-3 text-gray-600">{doc.category_name}</td>
-                  <td className="px-4 py-3 text-gray-600">{doc.page_count ?? '—'}</td>
+                  <td className="px-4 py-3 text-gray-100">{doc.category_name}</td>
+                  <td className="px-4 py-3 text-gray-100">{doc.page_count ?? '—'}</td>
                   <td className="px-4 py-3">
                     <span className={`badge-${doc.status}`}>{doc.status}</span>
                     {doc.status === 'error' && doc.error_message && (
@@ -184,13 +184,13 @@ export default function AdminDocuments() {
                       <p className="text-xs text-red-500 mt-1 font-medium">File missing on server — re-upload PDF</p>
                     )}
                   </td>
-                  <td className="px-4 py-3 text-gray-400 text-xs">{new Date(doc.created_at).toLocaleDateString()}</td>
+                  <td className="px-4 py-3 text-gray-100 text-xs">{new Date(doc.created_at).toLocaleDateString()}</td>
                   <td className="px-4 py-3">
                     <div className="flex items-center gap-1">
-                      <button onClick={() => handleReparse(doc.id)} title="Re-parse" className="p-1.5 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded">
+                      <button onClick={() => handleReparse(doc.id)} title="Re-parse" className="p-1.5 text-gray-100 hover:text-blue-600 hover:bg-blue-50 rounded">
                         <RefreshCw className="w-3.5 h-3.5" />
                       </button>
-                      <button onClick={() => handleDelete(doc.id)} title="Delete" className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded">
+                      <button onClick={() => handleDelete(doc.id)} title="Delete" className="p-1.5 text-gray-100 hover:text-red-600 hover:bg-red-50 rounded">
                         <Trash2 className="w-3.5 h-3.5" />
                       </button>
                     </div>

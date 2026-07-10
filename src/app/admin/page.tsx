@@ -99,13 +99,21 @@ export default function AdminDashboard() {
             <div className="card p-5 lg:col-span-2">
               <h2 className="font-semibold text-white mb-4 text-sm">Daily activity (30 days)</h2>
               <ResponsiveContainer width="100%" height={220}>
-                <BarChart data={metrics?.daily_activity ?? []}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.1)" />
-                  <XAxis dataKey="date" tick={{ fontSize: 10, fill: 'rgba(255,255,255,0.5)' }} tickFormatter={d => d.slice(5)} />
-                  <YAxis tick={{ fontSize: 10, fill: 'rgba(255,255,255,0.5)' }} />
-                  <Tooltip contentStyle={{ background: '#003d52', border: '1px solid rgba(255,255,255,0.1)', color: '#fff' }} />
-                  <Bar dataKey="count" fill="#0ea5c9" radius={[3, 3, 0, 0]} />
-                </BarChart>
+              <BarChart data={metrics?.daily_activity ?? []}>
+  <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.1)" />
+  <XAxis dataKey="date" tick={{ fontSize: 10, fill: 'rgba(255,255,255,0.5)' }} tickFormatter={d => d.slice(5)} />
+  <YAxis tick={{ fontSize: 10, fill: 'rgba(255,255,255,0.5)' }} />
+  <Tooltip
+    cursor={false}
+    contentStyle={{ background: '#003d52', border: '1px solid rgba(255,255,255,0.1)', color: '#fff' }}
+  />
+ <Bar
+  dataKey="count"
+  fill="#0ea5c9"
+  radius={[3, 3, 0, 0]}
+  activeBar={{ fill: '#38bdf8' }}
+/>
+</BarChart>
               </ResponsiveContainer>
             </div>
 

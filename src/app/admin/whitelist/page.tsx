@@ -59,12 +59,12 @@ export default function AdminWhitelist() {
         <div className="flex items-center gap-3 mb-6">
           <Link href="/admin" className="text-gray-400 hover:text-gray-600"><ChevronLeft className="w-5 h-5" /></Link>
           <Shield className="w-5 h-5 text-[#1B4F8A]" />
-          <h1 className="text-xl font-bold text-gray-900">URL Whitelist</h1>
+          <h1 className="text-xl font-bold text-gray-200">URL Whitelist</h1>
         </div>
 
         {/* Add form */}
         <div className="card p-5 mb-6">
-          <h2 className="font-semibold text-gray-800 mb-4 text-sm">Add allowed origin</h2>
+          <h2 className="font-semibold text-gray-200 mb-4 text-sm">Add allowed origin</h2>
           {error && <p className="text-red-600 text-sm mb-3">{error}</p>}
           <form onSubmit={handleAdd} className="flex gap-3">
             <input className="input flex-1" placeholder="https://yoursite.com" required
@@ -90,9 +90,9 @@ export default function AdminWhitelist() {
             </thead>
             <tbody className="divide-y divide-gray-100">
               {entries.map(e => (
-                <tr key={e.id} className="hover:bg-gray-50">
-                  <td className="px-4 py-3 font-mono text-xs text-gray-700">{e.origin}</td>
-                  <td className="px-4 py-3 text-gray-500 text-xs">{e.note || '—'}</td>
+                <tr key={e.id} className="hover:bg-white/5 hover:shadow-sm">
+                  <td className="px-4 py-3 font-mono text-xs text-gray-100">{e.origin}</td>
+                  <td className="px-4 py-3 text-gray-100 text-xs">{e.note || '—'}</td>
                   <td className="px-4 py-3">
                     <span className={`text-xs px-2 py-0.5 rounded-full ${e.is_active ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-500'}`}>
                       {e.is_active ? 'Active' : 'Inactive'}

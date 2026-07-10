@@ -9,8 +9,8 @@ import { ChevronLeft, Plus, Trash2, Edit2, FolderOpen, Check, X } from 'lucide-r
 export default function AdminCategories() {
   const { user, loading } = useAuth();
   const router = useRouter();
-  const [cats, setCats]     = useState<Category[]>([]);
-  const [form, setForm]     = useState({ name: '', description: '', parent_id: '' });
+  const [cats, setCats] = useState<Category[]>([]);
+  const [form, setForm] = useState({ name: '', description: '', parent_id: '' });
   const [editing, setEditing] = useState<Category | null>(null);
   const [saving, setSaving] = useState(false);
 
@@ -63,12 +63,12 @@ export default function AdminCategories() {
         <div className="flex items-center gap-3 mb-6">
           <Link href="/admin" className="text-gray-400 hover:text-gray-600"><ChevronLeft className="w-5 h-5" /></Link>
           <FolderOpen className="w-5 h-5 text-[#1B4F8A]" />
-          <h1 className="text-xl font-bold text-gray-900">Categories</h1>
+          <h1 className="text-xl font-bold text-gray-200">Categories</h1>
         </div>
 
         {/* Create form */}
         <div className="card p-5 mb-6">
-          <h2 className="font-semibold text-gray-800 mb-4 text-sm">New category</h2>
+          <h2 className="font-semibold text-gray-200 mb-4 text-sm">New category</h2>
           <form onSubmit={handleCreate} className="grid grid-cols-1 md:grid-cols-3 gap-3">
             <input className="input" placeholder="Category name *" required
               value={form.name} onChange={e => setForm(p => ({ ...p, name: e.target.value }))} />
@@ -99,16 +99,16 @@ export default function AdminCategories() {
             </thead>
             <tbody className="divide-y divide-gray-100">
               {cats.map(cat => (
-                <tr key={cat.id} className="hover:bg-gray-50">
+                <tr key={cat.id} className="hover:bg-white/5 hover:shadow-sm">
                   <td className="px-4 py-3">
                     {editing?.id === cat.id ? (
                       <input className="input text-sm" value={editing.name}
                         onChange={e => setEditing(p => p ? { ...p, name: e.target.value } : p)} />
                     ) : (
-                      <span className="font-medium text-gray-900">{cat.name}</span>
+                      <span className="font-medium text-gray-200">{cat.name}</span>
                     )}
                   </td>
-                  <td className="px-4 py-3 text-gray-500 text-xs">{(cat as Record<string, unknown>).parent_name as string || '—'}</td>
+                  <td className="px-4 py-3 text-gray-500 text-xs">{cat.parent_name || '—'}</td>
                   <td className="px-4 py-3 text-gray-500 text-xs">{cat.doc_count ?? 0}</td>
                   <td className="px-4 py-3">
                     <div className="flex items-center gap-1">

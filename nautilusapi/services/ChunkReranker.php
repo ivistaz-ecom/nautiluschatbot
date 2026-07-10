@@ -1,0 +1,118 @@
+<?php
+// backend/services/ChunkReranker.php
+
+require_once __DIR__ . '/DocumentParser.php';
+
+/**
+ * Re-ranks FULLTEXT retrieval results so substantive answer pages outrank
+ * table-of-contents / index hits that only mention a keyword once.
+ */
+class ChunkReranker {
+
+    /**
+     * @param  array<int, array<string, mixed>> $chunks
+     * @return array<int, array<string, mixed>>
+     */
+    public function rerank(array $chunks, string $question): array {
+        foreach ($chunks as &$chunk) {
+            $chunk['rerank_score'] = $this->computeScore($chunk, $question);
+        }
+        unset($chunk);
+
+        usort($chunks, fn($a, $b) => ($b['rerank_score'] ?? 0) <=> ($a['rerank_score'] ?? 0));
+
+        return $chunks;
+    }
+
+    /**
+     * Combine the DB FULLTEXT score with content-quality signals.
+     */
+    public function computeScore(array $chunk, string $question): float {
+        $content = $chunk['content'] ?? '';
+        $base    = max(0.01, (float) ($chunk['score'] ?? 1.0));
+
+        // TOC/index chunks match keywords but never contain the answer body.
+        if (DocumentParser::isTableOfContentsChunk($content)) {
+            return $base * 0.02;
+        }
+
+        $base *= self::substanceMultiplier($content);
+        $base *= 1.0 + $this->questionTermOverlap($content, $question);
+
+        return $base;
+    }
+
+    /**
+     * Boost chunks with explanatory prose; penalise heading/list-only text.
+     */
+    public static function substanceMultiplier(string $content): float {
+        $sentences = preg_split('/[.!?]+/u', $content, -1, PREG_SPLIT_NO_EMPTY);
+        $count     = count($sentences);
+        if ($count === 0) {
+            return 0.5;
+        }
+
+        $totalLen = 0;
+        foreach ($sentences as $sentence) {
+            $totalLen += mb_strlen(trim($sentence));
+        }
+        $avgLen = $totalLen / $count;
+
+        // Procedural paragraphs (typical answer text) sit in this band.
+        if ($avgLen >= 40 && $avgLen <= 280) {
+            return 1.5;
+        }
+        // Very short sentences → headings, bullets, TOC fragments.
+        if ($avgLen < 25) {
+            return 0.55;
+        }
+
+        return 1.0;
+    }
+
+    public static function substanceScore(string $content): float {
+        return self::substanceMultiplier($content);
+    }
+
+    private function questionTermOverlap(string $content, string $question): float {
+        $qTerms = $this->significantTerms($question);
+        if (empty($qTerms)) {
+            return 0.0;
+        }
+
+        $contentLower = mb_strtolower($content);
+        $hits         = 0;
+        foreach ($qTerms as $term) {
+            if (str_contains($contentLower, $term)) {
+                $hits++;
+            }
+        }
+
+        return $hits / count($qTerms);
+    }
+
+    /** @return string[] */
+    private function significantTerms(string $text): array {
+        $words = preg_split(
+            '/\s+/u',
+            mb_strtolower(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $text)),
+            -1,
+            PREG_SPLIT_NO_EMPTY
+        );
+
+        $stop = [
+            'a', 'an', 'the', 'is', 'are', 'was', 'what', 'how', 'when', 'where',
+            'why', 'who', 'which', 'this', 'that', 'and', 'or', 'of', 'in', 'for',
+            'to', 'with', 'on', 'at', 'by', 'from', 'be', 'do', 'does', 'did',
+        ];
+
+        $terms = [];
+        foreach ($words as $word) {
+            if (mb_strlen($word) >= 3 && !in_array($word, $stop, true)) {
+                $terms[] = $word;
+            }
+        }
+
+        return array_values(array_unique($terms));
+    }
+}

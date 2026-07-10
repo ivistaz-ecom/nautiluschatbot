@@ -47,7 +47,7 @@ export default function AdminQueries() {
       <div className="max-w-4xl mx-auto px-6 py-6">
         <div className="flex items-center gap-3 mb-6">
           <Link href="/admin" className="text-gray-400 hover:text-gray-600"><ChevronLeft className="w-5 h-5" /></Link>
-          <h1 className="text-xl font-bold text-gray-900">Unanswered Queries</h1>
+          <h1 className="text-xl font-bold text-gray-200">Unanswered Queries</h1>
           <span className="text-gray-400 text-sm ml-1">{total} results</span>
 
           <div className="ml-auto flex gap-2">

@@ -1,14 +1,24 @@
 'use client';
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { useAuth } from '@/lib/auth';
-import { api, ChatSession, ChatMessage, MessageSource, FAQ, Category, openDocumentSource } from '@/lib/api';
+import {
+  api, ChatSession, ChatMessage, MessageSource, FAQ, Category,
+  buildSourcePdfUrl, getSourceFileName, getSourcePageLabel,
+} from '@/lib/api';
+import { cacheMessageSources, applyCachedSourcesToMessages } from '@/lib/message-sources-cache';
 import {
   Send, Plus, Trash2, Book, MessageSquare, LogOut, ChevronRight,
   Search, FileText, AlertTriangle, CheckCircle, Sparkles, X
 } from 'lucide-react';
 import { Logo } from '@/components/Logo';
+
+function newMessageId(prefix = 'msg') {
+  return `${prefix}-${crypto.randomUUID()}`;
+}
+
+const ACTIVE_SESSION_KEY = 'nk_active_session';
 
 export default function ChatPage() {
   const { user, logout, loading: authLoading } = useAuth();
@@ -25,6 +35,7 @@ export default function ChatPage() {
   const [showFaqs, setShowFaqs]       = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const restoredSessionRef = useRef(false);
 
   useEffect(() => {
     if (!authLoading && !user) router.push('/login');
@@ -37,6 +48,17 @@ export default function ChatPage() {
       api.chat.categories().then(r => setCategories(r.data)).catch(() => {});
     }
   }, [user]);
+
+  // Re-open the last active chat after a browser refresh.
+  useEffect(() => {
+    if (!user || sessions.length === 0 || activeSession || restoredSessionRef.current) return;
+
+    const saved = localStorage.getItem(ACTIVE_SESSION_KEY);
+    if (!saved || !sessions.some(s => String(s.id) === saved)) return;
+
+    restoredSessionRef.current = true;
+    openSession(saved);
+  }, [user, sessions, activeSession]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -58,21 +80,30 @@ export default function ChatPage() {
 
   async function openSession(id: string) {
     setActive(id);
+    localStorage.setItem(ACTIVE_SESSION_KEY, id);
     try {
       const r = await api.chat.session(id);
-      setMessages(r.data.messages);
+      const messages = applyCachedSourcesToMessages(r.data.messages);
+      setMessages(messages);
     } catch {}
   }
 
   async function newSession() {
     setActive(null);
     setMessages([]);
+    localStorage.removeItem(ACTIVE_SESSION_KEY);
+    restoredSessionRef.current = false;
   }
 
   async function deleteSession(id: string, e: React.MouseEvent) {
     e.stopPropagation();
     await api.chat.deleteSession(id);
-    if (activeSession === id) { setActive(null); setMessages([]); }
+    if (activeSession === id) {
+      setActive(null);
+      setMessages([]);
+      localStorage.removeItem(ACTIVE_SESSION_KEY);
+      restoredSessionRef.current = false;
+    }
     setSessions(prev => prev.filter(s => s.id !== id));
   }
 
@@ -84,7 +115,7 @@ export default function ChatPage() {
     setAsking(true);
 
     // Optimistic user message
-    const tempId = 'temp-' + Date.now();
+    const tempId = newMessageId('temp');
     setMessages(prev => [...prev, {
       id: tempId, session_id: activeSession ?? '', user_id: user!.id,
       role: 'user', question: text, created_at: new Date().toISOString()
@@ -92,17 +123,29 @@ export default function ChatPage() {
 
     try {
       const r = await api.chat.ask(text, activeSession ?? undefined, selectedCat);
-      const { session_id, answer, sources, is_answered } = r.data;
+      const { session_id, message_id, answer, sources, is_answered } = r.data;
 
       if (!activeSession) {
         setActive(session_id);
+        localStorage.setItem(ACTIVE_SESSION_KEY, session_id);
         await loadSessions();
       }
 
+      const enrichedSources = sources ? [...sources] : [];
+      cacheMessageSources(String(message_id), enrichedSources);
+
       setMessages(prev => [
         ...prev.filter(m => m.id !== tempId),
-        { id: String(Date.now()), session_id, role: 'user', question: text, created_at: new Date().toISOString() } as ChatMessage,
-        { id: String(Date.now() + 1), session_id, role: 'assistant', answer, sources, is_answered: is_answered ? 1 : 0, created_at: new Date().toISOString() } as ChatMessage,
+        { id: newMessageId('user'), session_id, role: 'user', question: text, created_at: new Date().toISOString() } as ChatMessage,
+        {
+          id: String(message_id),
+          session_id,
+          role: 'assistant',
+          answer,
+          sources: enrichedSources,
+          is_answered: is_answered ? 1 : 0,
+          created_at: new Date().toISOString(),
+        } as ChatMessage,
       ]);
 
       if (!is_answered) loadFaqs();
@@ -110,7 +153,7 @@ export default function ChatPage() {
       const msg = err instanceof Error ? err.message : 'Something went wrong';
       setMessages(prev => [
         ...prev.filter(m => m.id !== tempId),
-        { id: String(Date.now()), session_id: '', role: 'assistant', answer: `Error: ${msg}`, is_answered: 0, created_at: new Date().toISOString() } as ChatMessage,
+        { id: newMessageId('error'), session_id: '', role: 'assistant', answer: `Error: ${msg}`, is_answered: 0, created_at: new Date().toISOString() } as ChatMessage,
       ]);
     } finally {
       setAsking(false);
@@ -329,12 +372,15 @@ function MessageBubble({ msg, onAskQuery }: { msg: ChatMessage; onAskQuery: () =
           <p className="text-white/90 leading-relaxed whitespace-pre-wrap">{msg.answer}</p>
         </div>
 
-        {/* Sources */}
+        {/* Sources — each badge deep-links to the cited PDF page */}
         {msg.sources && msg.sources.length > 0 && (
-          <div className="flex flex-wrap gap-2">
-            {msg.sources.map((src, i) => (
-              <SourceBadge key={i} source={src} />
-            ))}
+          <div className="space-y-1.5">
+            <p className="text-[11px] font-medium uppercase tracking-wide text-white/40">Sources</p>
+            <div className="flex flex-wrap gap-2">
+              {msg.sources.map((src, i) => (
+                <SourceBadge key={`${src.fileId ?? src.document_id ?? i}-${src.pageNumber ?? src.page_number ?? i}`} source={src} />
+              ))}
+            </div>
           </div>
         )}
 
@@ -363,33 +409,47 @@ function MessageBubble({ msg, onAskQuery }: { msg: ChatMessage; onAskQuery: () =
 }
 
 function SourceBadge({ source }: { source: MessageSource }) {
-  const [opening, setOpening] = useState(false);
+  const fileName = getSourceFileName(source);
+  const pageLabel = getSourcePageLabel(source);
+  const token = typeof window !== 'undefined' ? localStorage.getItem('nk_token') : null;
+  const href = token ? buildSourcePdfUrl(source, token) : undefined;
 
-  async function handleOpen() {
-    if (opening) return;
-    setOpening(true);
-    try {
-      await openDocumentSource(source);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Could not open document. Please try again.';
-      alert(message);
-    } finally {
-      setOpening(false);
-    }
+  const title = pageLabel
+    ? `Open ${fileName} at ${pageLabel}`
+    : `Open ${fileName}`;
+
+  if (!href) {
+    return (
+      <span
+        title="Please log in again to view documents"
+        className="inline-flex items-center gap-1.5 bg-white/10 text-white/50 text-xs rounded-lg px-2.5 py-1.5 border border-white/20 max-w-full cursor-not-allowed"
+      >
+        <FileText className="w-3 h-3 flex-shrink-0" />
+        <span className="font-medium truncate max-w-[200px]">{fileName}</span>
+        {pageLabel != null && (
+          <span className="flex-shrink-0 rounded-md bg-brand-accent/20 text-brand-accent border border-brand-accent/30 px-1.5 py-0.5 font-semibold tabular-nums">
+            {pageLabel}
+          </span>
+        )}
+      </span>
+    );
   }
 
   return (
-    <button
-      type="button"
-      onClick={handleOpen}
-      disabled={opening}
-      title={`Open ${source.document_title} at page ${source.page_number}`}
-      className="flex items-center gap-1.5 bg-white/10 text-white/80 text-xs rounded-lg px-2.5 py-1.5 border border-white/20 hover:bg-white/20 hover:border-white/30 transition-colors cursor-pointer disabled:opacity-60 disabled:cursor-wait"
+    <a
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      title={title}
+      className="inline-flex items-center gap-1.5 bg-white/10 text-white/80 text-xs rounded-lg px-2.5 py-1.5 border border-white/20 hover:bg-white/20 hover:border-white/30 transition-colors cursor-pointer max-w-full"
     >
       <FileText className="w-3 h-3 flex-shrink-0" />
-      <span className="font-medium truncate max-w-[200px]">{source.document_title}</span>
-      <span className="text-white/40">·</span>
-      <span>p.{source.page_number}</span>
-    </button>
+      <span className="font-medium truncate max-w-[200px]">{fileName}</span>
+      {pageLabel != null && (
+        <span className="flex-shrink-0 rounded-md bg-brand-accent/20 text-brand-accent border border-brand-accent/30 px-1.5 py-0.5 font-semibold tabular-nums">
+          {pageLabel}
+        </span>
+      )}
+    </a>
   );
 }

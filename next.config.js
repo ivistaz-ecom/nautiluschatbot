@@ -2,7 +2,11 @@
 const nextConfig = {
   reactStrictMode: true,
   env: {
-    NEXT_PUBLIC_API_URL: process.env.NEXT_PUBLIC_API_URL || 'https://nautilus.crafttechhub.com/api/v1',
+    NEXT_PUBLIC_API_URL:
+      process.env.NEXT_PUBLIC_API_URL ||
+      (process.env.NODE_ENV === 'development'
+        ? '/api/proxy/v1'
+        : 'https://nautilus.crafttechhub.com/api/v1'),
   },
 }
 

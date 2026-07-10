@@ -43,7 +43,7 @@ export default function AdminUsers() {
         <div className="flex items-center gap-3 mb-6">
           <Link href="/admin" className="text-gray-400 hover:text-gray-600"><ChevronLeft className="w-5 h-5" /></Link>
           <Users className="w-5 h-5 text-[#1B4F8A]" />
-          <h1 className="text-xl font-bold text-gray-900">Users</h1>
+          <h1 className="text-xl font-bold text-gray-200">Users</h1>
           <span className="text-gray-400 text-sm ml-1">{total} total</span>
         </div>
 
@@ -84,7 +84,7 @@ export default function AdminUsers() {
                         {u.name[0]}
                       </div>
                       <div>
-                        <p className="font-medium text-gray-900">{u.name}</p>
+                        <p className="font-medium text-gray-200">{u.name}</p>
                         <p className="text-xs text-gray-400">{u.email}</p>
                       </div>
                     </div>
