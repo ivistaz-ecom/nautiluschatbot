@@ -7,7 +7,7 @@ import {
   api, ChatSession, ChatMessage, MessageSource, FAQ, Category,
   buildSourcePdfUrl, getSourceFileName, getSourcePageLabel,
 } from '@/lib/api';
-import { cacheMessageSources, applyCachedSourcesToMessages } from '@/lib/message-sources-cache';
+import { cacheAssistantTurn, applyCachedTurnToMessages, cacheSessionMessages, getCachedSessionMessages } from '@/lib/message-sources-cache';
 import {
   Send, Plus, Trash2, Book, MessageSquare, LogOut, ChevronRight,
   Search, FileText, AlertTriangle, CheckCircle, Sparkles, X
@@ -31,11 +31,17 @@ export default function ChatPage() {
   const [categories, setCategories]   = useState<Category[]>([]);
   const [question, setQuestion]       = useState('');
   const [asking, setAsking]           = useState(false);
+  const [loadingSession, setLoadingSession] = useState(false);
   const [selectedCat, setSelectedCat] = useState<number | undefined>();
   const [showFaqs, setShowFaqs]       = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const bottomRef = useRef<HTMLDivElement>(null);
-  const restoredSessionRef = useRef(false);
+  const syncedSessionRef = useRef<string | null>(null);
+  const sessionLoadGen = useRef(0);
+
+  function normalizeSessionId(id: string | number | null | undefined): string {
+    return id == null ? '' : String(id);
+  }
 
   useEffect(() => {
     if (!authLoading && !user) router.push('/login');
@@ -49,16 +55,25 @@ export default function ChatPage() {
     }
   }, [user]);
 
-  // Re-open the last active chat after a browser refresh.
+  // Instant restore after refresh (before API round-trip).
   useEffect(() => {
-    if (!user || sessions.length === 0 || activeSession || restoredSessionRef.current) return;
-
+    if (!user) return;
     const saved = localStorage.getItem(ACTIVE_SESSION_KEY);
-    if (!saved || !sessions.some(s => String(s.id) === saved)) return;
+    if (!saved) return;
+    setActive(saved);
+    const cached = getCachedSessionMessages(saved);
+    if (cached?.length) setMessages(cached);
+  }, [user]);
 
-    restoredSessionRef.current = true;
-    openSession(saved);
-  }, [user, sessions, activeSession]);
+  // Sync active session with server once session list is loaded (background).
+  useEffect(() => {
+    if (!user || sessions.length === 0) return;
+    const saved = localStorage.getItem(ACTIVE_SESSION_KEY);
+    if (!saved || !sessions.some(s => normalizeSessionId(s.id) === saved)) return;
+    if (syncedSessionRef.current === saved) return;
+    syncedSessionRef.current = saved;
+    openSession(saved, { background: true });
+  }, [user, sessions]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -78,33 +93,61 @@ export default function ChatPage() {
     } catch {}
   }
 
-  async function openSession(id: string) {
-    setActive(id);
-    localStorage.setItem(ACTIVE_SESSION_KEY, id);
+  async function openSession(id: string | number, options?: { background?: boolean }) {
+    const sessionId = normalizeSessionId(id);
+    const loadGen = ++sessionLoadGen.current;
+
+    setActive(sessionId);
+    localStorage.setItem(ACTIVE_SESSION_KEY, sessionId);
+    if (!options?.background) syncedSessionRef.current = sessionId;
+
+    const cached = getCachedSessionMessages(sessionId);
+    if (!options?.background) {
+      if (cached?.length) {
+        setMessages(cached);
+      } else {
+        setMessages([]);
+        setLoadingSession(true);
+      }
+    }
+
     try {
-      const r = await api.chat.session(id);
-      const messages = applyCachedSourcesToMessages(r.data.messages);
-      setMessages(messages);
-    } catch {}
+      const r = await api.chat.session(sessionId);
+      if (loadGen !== sessionLoadGen.current) return;
+
+      const loaded = applyCachedTurnToMessages(r.data.messages);
+      setMessages(loaded);
+      cacheSessionMessages(sessionId, loaded);
+    } catch {
+      if (loadGen !== sessionLoadGen.current) return;
+      if (cached?.length) setMessages(cached);
+    } finally {
+      if (loadGen === sessionLoadGen.current) {
+        setLoadingSession(false);
+      }
+    }
   }
 
   async function newSession() {
+    sessionLoadGen.current += 1;
     setActive(null);
     setMessages([]);
+    setLoadingSession(false);
     localStorage.removeItem(ACTIVE_SESSION_KEY);
-    restoredSessionRef.current = false;
   }
 
-  async function deleteSession(id: string, e: React.MouseEvent) {
+  async function deleteSession(id: string | number, e: React.MouseEvent) {
     e.stopPropagation();
-    await api.chat.deleteSession(id);
-    if (activeSession === id) {
+    const sessionId = normalizeSessionId(id);
+    await api.chat.deleteSession(sessionId);
+    if (activeSession === sessionId) {
+      sessionLoadGen.current += 1;
       setActive(null);
       setMessages([]);
+      setLoadingSession(false);
       localStorage.removeItem(ACTIVE_SESSION_KEY);
-      restoredSessionRef.current = false;
     }
-    setSessions(prev => prev.filter(s => s.id !== id));
+    setSessions(prev => prev.filter(s => normalizeSessionId(s.id) !== sessionId));
   }
 
   async function sendQuestion(q?: string) {
@@ -124,29 +167,40 @@ export default function ChatPage() {
     try {
       const r = await api.chat.ask(text, activeSession ?? undefined, selectedCat);
       const { session_id, message_id, answer, sources, is_answered } = r.data;
+      const sid = normalizeSessionId(activeSession ?? session_id);
 
       if (!activeSession) {
-        setActive(session_id);
-        localStorage.setItem(ACTIVE_SESSION_KEY, session_id);
+        setActive(sid);
+        localStorage.setItem(ACTIVE_SESSION_KEY, sid);
         await loadSessions();
       }
 
-      const enrichedSources = sources ? [...sources] : [];
-      cacheMessageSources(String(message_id), enrichedSources);
-
-      setMessages(prev => [
-        ...prev.filter(m => m.id !== tempId),
-        { id: newMessageId('user'), session_id, role: 'user', question: text, created_at: new Date().toISOString() } as ChatMessage,
-        {
-          id: String(message_id),
-          session_id,
-          role: 'assistant',
+      const enrichedSources = is_answered && sources ? [...sources] : [];
+      if (is_answered) {
+        cacheAssistantTurn(String(message_id), {
           answer,
+          is_answered: true,
           sources: enrichedSources,
-          is_answered: is_answered ? 1 : 0,
-          created_at: new Date().toISOString(),
-        } as ChatMessage,
-      ]);
+        });
+      }
+
+      setMessages(prev => {
+        const next = [
+          ...prev.filter(m => m.id !== tempId),
+          { id: newMessageId('user'), session_id: sid, role: 'user', question: text, created_at: new Date().toISOString() } as ChatMessage,
+          {
+            id: String(message_id),
+            session_id: sid,
+            role: 'assistant',
+            answer,
+            sources: enrichedSources,
+            is_answered: is_answered ? 1 : 0,
+            created_at: new Date().toISOString(),
+          } as ChatMessage,
+        ];
+        cacheSessionMessages(sid, next);
+        return next;
+      });
 
       if (!is_answered) loadFaqs();
     } catch (err: unknown) {
@@ -204,7 +258,7 @@ export default function ChatPage() {
             <div
               key={s.id}
               onClick={() => openSession(s.id)}
-              className={`flex items-center gap-2 px-3 py-2 rounded-lg cursor-pointer group transition-colors ${activeSession === s.id ? 'bg-white/15 text-white' : 'hover:bg-white/10 text-white/80'}`}
+              className={`flex items-center gap-2 px-3 py-2 rounded-lg cursor-pointer group transition-colors ${activeSession === normalizeSessionId(s.id) ? 'bg-white/15 text-white' : 'hover:bg-white/10 text-white/80'}`}
             >
               <MessageSquare className="w-3.5 h-3.5 flex-shrink-0" />
               <span className="text-sm truncate flex-1">{s.title || 'New chat'}</span>
@@ -245,7 +299,7 @@ export default function ChatPage() {
             <ChevronRight className={`w-4 h-4 transition-transform ${sidebarOpen ? 'rotate-180' : ''}`} />
           </button>
           <h1 className="font-semibold text-white text-sm">
-            {activeSession ? (sessions.find(s => s.id === activeSession)?.title ?? 'Chat') : 'New conversation'}
+            {activeSession ? (sessions.find(s => normalizeSessionId(s.id) === activeSession)?.title ?? 'Chat') : 'New conversation'}
           </h1>
           {user?.role === 'admin' && (
             <Link href="/admin" className="ml-auto text-xs text-brand-accent hover:underline font-medium">
@@ -279,7 +333,9 @@ export default function ChatPage() {
 
         {/* Messages */}
         <div className="flex-1 overflow-y-auto px-6 py-6 space-y-6">
-          {messages.length === 0 && (
+          {loadingSession && messages.length === 0 && <SessionSkeleton />}
+
+          {!loadingSession && messages.length === 0 && (
             <div className="flex flex-col items-center justify-center h-full text-center">
               <div className="w-14 h-14 bg-white/10 rounded-2xl flex items-center justify-center mb-4">
                 <Search className="w-6 h-6 text-white/70" />
@@ -298,7 +354,7 @@ export default function ChatPage() {
             <MessageBubble key={msg.id} msg={msg} onAskQuery={() => setQuestion(msg.question ?? '')} />
           ))}
 
-          {asking && (
+          {asking && !loadingSession && (
             <div className="flex gap-3">
               <div className="w-8 h-8 bg-white/20 rounded-full flex items-center justify-center flex-shrink-0 overflow-hidden">
                 <img src="/white-logo.webp" alt="" className="w-5 h-5 object-contain" />
@@ -342,6 +398,27 @@ export default function ChatPage() {
   );
 }
 
+function SessionSkeleton() {
+  return (
+    <div className="space-y-6 animate-pulse">
+      {[0, 1].map((pair) => (
+        <div key={pair} className="space-y-4">
+          <div className="flex justify-end">
+            <div className="h-10 w-2/5 max-w-sm rounded-2xl rounded-tr-none bg-white/10" />
+          </div>
+          <div className="flex gap-3">
+            <div className="w-8 h-8 rounded-full bg-white/10 flex-shrink-0" />
+            <div className="flex-1 max-w-2xl space-y-2">
+              <div className="h-24 rounded-2xl rounded-tl-none bg-white/10" />
+              <div className="h-8 w-48 rounded-lg bg-white/10" />
+            </div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 // ── Message bubble component ─────────────────────────────────────
 function MessageBubble({ msg, onAskQuery }: { msg: ChatMessage; onAskQuery: () => void }) {
   const [submitDone, setSubmitDone] = useState(false);
@@ -372,8 +449,8 @@ function MessageBubble({ msg, onAskQuery }: { msg: ChatMessage; onAskQuery: () =
           <p className="text-white/90 leading-relaxed whitespace-pre-wrap">{msg.answer}</p>
         </div>
 
-        {/* Sources — each badge deep-links to the cited PDF page */}
-        {msg.sources && msg.sources.length > 0 && (
+        {/* Sources — only when the answer was found in documents */}
+        {msg.is_answered !== 0 && msg.sources && msg.sources.length > 0 && (
           <div className="space-y-1.5">
             <p className="text-[11px] font-medium uppercase tracking-wide text-white/40">Sources</p>
             <div className="flex flex-wrap gap-2">

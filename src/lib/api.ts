@@ -1,6 +1,6 @@
 // src/lib/api.ts
 
-import { API_URL, API_BACKEND_URL } from './api-config';
+import { API_URL, DOCUMENT_API_URL } from './api-config';
 
 function getToken(): string | null {
   if (typeof window === 'undefined') return null;
@@ -29,13 +29,23 @@ async function request<T>(
       : undefined,
   });
 
-  const data = await res.json();
-
-  if (!res.ok) {
-    throw new ApiError(data.message || 'Request failed', res.status, data.errors);
+  let data: Record<string, unknown> = {};
+  const raw = await res.text();
+  try {
+    data = raw ? JSON.parse(raw) : {};
+  } catch {
+    throw new ApiError(
+      res.ok ? 'Invalid server response' : `Request failed (${res.status})`,
+      res.status
+    );
   }
 
-  return data;
+  if (!res.ok) {
+    const message = typeof data.message === 'string' ? data.message : 'Request failed';
+    throw new ApiError(message, res.status, data.errors as Record<string, string[]> | undefined);
+  }
+
+  return data as T;
 }
 
 export class ApiError extends Error {
@@ -92,6 +102,81 @@ async function requestLocalSession(id: string): Promise<{ data: { session: ChatS
   return data;
 }
 
+async function requestLocalDocumentUpload<T>(formData: FormData): Promise<T> {
+  const token = getToken();
+  const headers: HeadersInit = {};
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+
+  const res = await fetch('/api/admin/documents/upload', {
+    method: 'POST',
+    headers,
+    body: formData,
+  });
+
+  const data = await res.json();
+  if (!res.ok) {
+    throw new ApiError(data.message || 'Upload failed', res.status, data.errors);
+  }
+  return data as T;
+}
+
+async function requestLocalDocumentReparse(id: number, formData?: FormData): Promise<{ message?: string; data?: { status?: string; error?: string } }> {
+  const token = getToken();
+  const headers: HeadersInit = {};
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+
+  const res = await fetch(`/api/admin/documents/${id}/reparse`, {
+    method: 'POST',
+    headers,
+    body: formData,
+  });
+
+  const data = await res.json();
+  if (!res.ok) {
+    throw new ApiError(data.message || 'Re-parse failed', res.status, data.errors);
+  }
+  return data;
+}
+
+async function requestLocalDocumentUpdate<T>(
+  id: number,
+  data: {
+    title: string;
+    category_id: number;
+    original_filename?: string;
+    category_name?: string;
+  }
+): Promise<T> {
+  const token = getToken();
+  const headers: HeadersInit = { 'Content-Type': 'application/json' };
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+
+  const res = await fetch(`/api/admin/documents/${id}`, {
+    method: 'PUT',
+    headers,
+    body: JSON.stringify(data),
+  });
+
+  const payload = await res.json();
+  if (!res.ok) {
+    throw new ApiError(payload.message || 'Update failed', res.status, payload.errors);
+  }
+  return payload as T;
+}
+
+async function requestLocalKnowledgeHealth(): Promise<{ data: KnowledgeHealthReport }> {
+  const token = getToken();
+  const headers: HeadersInit = {};
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+
+  const res = await fetch('/api/admin/knowledge-health', { headers, cache: 'no-store' });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new ApiError(data.message || 'Request failed', res.status, data.errors);
+  }
+  return data;
+}
+
 export const api = {
   // Auth
   auth: {
@@ -130,6 +215,7 @@ export const api = {
   // Admin
   admin: {
     metrics: () => request<{ data: Metrics }>('GET', '/admin/metrics'),
+    knowledgeHealth: () => requestLocalKnowledgeHealth(),
 
     documents: {
       list: (params?: Record<string, string | number>) => {
@@ -137,10 +223,17 @@ export const api = {
         return request<PaginatedResponse<Document>>('GET', `/admin/documents?${qs}`);
       },
       upload: (formData: FormData) =>
-        request<{ data: { document_id: number } }>('POST', '/admin/documents', formData, true),
+        requestLocalDocumentUpload<{ data: { document_id: number; status?: string; error?: string }; message?: string }>(formData),
       show: (id: number) => request<{ data: Document }>('GET', `/admin/documents/${id}`),
+      update: (id: number, data: {
+        title: string;
+        category_id: number;
+        original_filename?: string;
+        category_name?: string;
+      }) =>
+        requestLocalDocumentUpdate<{ data: Document; local_only?: boolean; message?: string }>(id, data),
       delete: (id: number) => request('DELETE', `/admin/documents/${id}`),
-      reparse: (id: number) => request('POST', `/admin/documents/${id}/reparse`),
+      reparse: (id: number, formData?: FormData) => requestLocalDocumentReparse(id, formData),
     },
 
     categories: {
@@ -243,6 +336,9 @@ export interface MessageSource {
   page_label?: string | null;
   pageLabel?: string | null;
   pdfUrl?: string;
+  /** Short quote from the PDF page used to ground this citation. */
+  excerpt?: string | null;
+  snippet?: string | null;
 }
 
 /** Resolve the document id from either snake_case or camelCase source fields. */
@@ -282,13 +378,13 @@ export function getSourcePageNumbers(source: MessageSource): number[] {
   return Number.isFinite(number) && number > 0 ? [number] : [];
 }
 
-/** Human-readable page label, e.g. "Page 49" or "Pages 45–47". */
+/** Human-readable page label — always matches the PDF link (#page=N). */
 export function getSourcePageLabel(source: MessageSource): string | undefined {
-  const label = source.pageLabel ?? source.page_label;
-  if (label) return label;
-
   const pages = getSourcePageNumbers(source);
-  if (pages.length === 0) return undefined;
+  if (pages.length === 0) {
+    const label = source.pageLabel ?? source.page_label;
+    return label || undefined;
+  }
   if (pages.length === 1) return `Page ${pages[0]}`;
 
   const sorted = [...pages].sort((a, b) => a - b);
@@ -298,6 +394,12 @@ export function getSourcePageLabel(source: MessageSource): string | undefined {
   }
 
   return `Pages ${sorted.join(', ')}`;
+}
+
+/** PDF excerpt shown under source badges for verification. */
+export function getSourceExcerpt(source: MessageSource): string | undefined {
+  const text = (source.excerpt ?? source.snippet ?? '').trim();
+  return text || undefined;
 }
 
 async function fetchDocumentFile(documentId: number): Promise<Blob> {
@@ -322,63 +424,22 @@ async function fetchDocumentFile(documentId: number): Promise<Blob> {
   return res.blob();
 }
 
-/** Resolve API base to an absolute URL (needed for document links in dev proxy mode). */
-function resolveApiBase(): string {
-  const trimmed = API_URL.replace(/\/$/, '');
-  if (/^https?:\/\//i.test(trimmed)) return trimmed;
-
-  if (typeof window !== 'undefined') {
-    const path = trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
-    return new URL(path, window.location.origin).href;
-  }
-
-  return API_BACKEND_URL.replace(/\/$/, '');
-}
-
 /**
  * Build the document viewer URL, appending #page=N for PDFs when page metadata exists.
- * Example: /api/v1/chat/documents/3/file?token=xxxxx#page=27
+ * Always targets the real API host — never the dev JSON proxy (PDFs are binary).
  */
 export function buildSourcePdfUrl(source: MessageSource, token: string): string {
   const fileId = getSourceFileId(source);
-  const apiBase = resolveApiBase();
-  let base =
-    source.pdfUrl ??
-    source.pdf_url ??
-    `${apiBase}/chat/documents/${fileId}/file?token=${encodeURIComponent(token)}`;
-
-  // API may return a path like /api/v1/chat/documents/3/file?token=... — resolve to absolute URL
-  if (base.startsWith('/')) {
-    const origin =
-      typeof window !== 'undefined'
-        ? window.location.origin
-        : new URL(API_BACKEND_URL).origin;
-    base = `${origin}${base}`;
-  } else if (!/^https?:\/\//i.test(base)) {
-    base = `${apiBase}/chat/documents/${fileId}/file?token=${encodeURIComponent(token)}`;
-  }
-
-  // Ensure token is present when opening from a pdfUrl that omitted it
-  try {
-    const parsed = new URL(base);
-    if (!parsed.searchParams.get('token') && token) {
-      parsed.searchParams.set('token', token);
-      base = parsed.toString();
-    }
-  } catch {
-    // keep base as-is
-  }
+  const base = `${DOCUMENT_API_URL}/chat/documents/${fileId}/file?token=${encodeURIComponent(token)}`;
 
   const isPdf = !source.mime_type || source.mime_type === 'application/pdf';
   const page = getSourcePageNumber(source);
 
   if (isPdf && page) {
-    // Strip any existing hash so we always deep-link to the cited page.
-    const withoutHash = base.split('#')[0];
-    return `${withoutHash}#page=${page}`;
+    return `${base}#page=${page}`;
   }
 
-  return base.split('#')[0];
+  return base;
 }
 
 export function openDocumentSource(source: MessageSource): void {
@@ -419,14 +480,41 @@ export interface Document {
   id: number;
   title: string;
   original_filename: string;
+  category_id?: number;
   mime_type: string;
   file_size: number;
   page_count?: number;
+  chunk_count?: number;
   status: 'pending' | 'processing' | 'ready' | 'error';
   category_name?: string;
   error_message?: string;
   file_on_disk?: boolean;
   created_at: string;
+}
+
+export type IndexingHealth = 'good' | 'low' | 'none' | 'not_ready';
+
+export interface KnowledgeHealthDocument {
+  id: number;
+  title: string;
+  original_filename?: string;
+  status: string;
+  page_count: number | null;
+  chunk_count: number;
+  file_on_disk: boolean;
+  indexing: IndexingHealth;
+}
+
+export interface KnowledgeHealthReport {
+  summary: {
+    total_documents: number;
+    ready_documents: number;
+    total_chunks: number;
+    low_indexing: number;
+    not_indexed: number;
+    errors: number;
+  };
+  documents: KnowledgeHealthDocument[];
 }
 
 export interface Category {

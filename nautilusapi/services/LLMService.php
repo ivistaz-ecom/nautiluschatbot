@@ -326,8 +326,10 @@ PROMPT;
 
         $normalized = mb_strtolower($trimmed);
         return str_starts_with($normalized, 'unanswered:')
-            || str_contains($normalized, 'could not find this information')
-            || str_contains($normalized, 'i could not find this information');
+            || str_contains($normalized, 'could not find')
+            || str_contains($normalized, 'i could not find')
+            || str_contains($normalized, 'not found in the knowledge base')
+            || str_contains($normalized, 'not found in the available documents');
     }
 
     /**

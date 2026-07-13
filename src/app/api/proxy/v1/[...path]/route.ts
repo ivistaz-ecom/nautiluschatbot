@@ -15,22 +15,40 @@ async function proxy(req: NextRequest, { params }: RouteContext) {
   const auth = req.headers.get('authorization');
   if (auth) headers['Authorization'] = auth;
 
-  const contentType = req.headers.get('content-type');
-  if (contentType) headers['Content-Type'] = contentType;
+  const requestContentType = req.headers.get('content-type');
+  if (requestContentType) headers['Content-Type'] = requestContentType;
 
-  const upstream = await fetch(target, {
-    method: req.method,
-    headers,
-    body: ['GET', 'HEAD'].includes(req.method) ? undefined : await req.arrayBuffer(),
-  });
+  try {
+    const upstream = await fetch(target, {
+      method: req.method,
+      headers,
+      body: ['GET', 'HEAD'].includes(req.method) ? undefined : await req.arrayBuffer(),
+    });
 
-  const body = await upstream.text();
-  return new NextResponse(body, {
-    status: upstream.status,
-    headers: {
-      'Content-Type': upstream.headers.get('Content-Type') || 'application/json',
-    },
-  });
+    const contentType = upstream.headers.get('Content-Type') || 'application/json';
+    const isBinary =
+      /\/file(\?|$)/.test(path) ||
+      contentType.includes('application/pdf') ||
+      contentType.includes('application/octet-stream') ||
+      contentType.includes('application/vnd.');
+
+    const body = isBinary ? await upstream.arrayBuffer() : await upstream.text();
+
+    const responseHeaders = new Headers();
+    responseHeaders.set('Content-Type', contentType);
+    const contentDisposition = upstream.headers.get('Content-Disposition');
+    if (contentDisposition) responseHeaders.set('Content-Disposition', contentDisposition);
+
+    return new NextResponse(body, {
+      status: upstream.status,
+      headers: responseHeaders,
+    });
+  } catch {
+    return NextResponse.json(
+      { success: false, message: 'Dev API proxy unavailable. Restart npm run dev.' },
+      { status: 502 }
+    );
+  }
 }
 
 export const GET = proxy;

@@ -1,10 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { enrichAnswerSources, type SourceLike } from '@/lib/chat-source-attribution';
+import { resolveAssistantTurn } from '@/lib/chat-source-attribution';
 import { API_BACKEND_URL } from '@/lib/api-config';
 
+export const dynamic = 'force-dynamic';
+
 /**
- * Proxies POST /chat/ask to the PHP API, then enriches PDF source cards
- * with correct page numbers and deep-link URLs.
+ * Proxies POST /chat/ask to the PHP API, then recovers missed answers
+ * and attaches exact PDF page citations.
  */
 export async function POST(req: NextRequest) {
   const auth = req.headers.get('authorization') || '';
@@ -30,15 +32,16 @@ export async function POST(req: NextRequest) {
     return NextResponse.json(payload);
   }
 
-  const answered = Boolean(data.is_answered);
-  const answer = typeof data.answer === 'string' ? data.answer : '';
   const question = typeof body?.question === 'string' ? body.question : '';
-  const rawSources: SourceLike[] = Array.isArray(data.sources) ? data.sources : [];
+  const answer = typeof data.answer === 'string' ? data.answer : '';
+  const isAnswered = Boolean(data.is_answered);
+  const rawSources = Array.isArray(data.sources) ? data.sources : [];
 
-  if (answered && answer) {
-    data.sources = await enrichAnswerSources(auth, question, answer, rawSources);
-    payload.data = data;
-  }
+  const resolved = await resolveAssistantTurn(auth, question, answer, isAnswered, rawSources);
+  data.answer = resolved.answer;
+  data.is_answered = resolved.is_answered;
+  data.sources = resolved.sources;
+  payload.data = data;
 
   return NextResponse.json(payload);
 }

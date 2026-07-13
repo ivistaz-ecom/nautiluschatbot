@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { enrichAnswerSources, type SourceLike } from '@/lib/chat-source-attribution';
+import { resolveSessionMessage, type SourceLike } from '@/lib/chat-source-attribution';
 import { API_BACKEND_URL } from '@/lib/api-config';
+
+export const dynamic = 'force-dynamic';
 
 type SessionMessage = {
   role?: string;
@@ -24,8 +26,7 @@ function parseSources(raw: SessionMessage['sources']): SourceLike[] {
 }
 
 /**
- * Proxies GET /chat/sessions/:id and re-enriches assistant message sources
- * so PDF cards + page numbers survive a browser refresh.
+ * Proxies GET /chat/sessions/:id — fast reload from DB; PDF scan only when needed.
  */
 export async function GET(
   req: NextRequest,
@@ -38,6 +39,7 @@ export async function GET(
     headers: {
       ...(auth ? { Authorization: auth } : {}),
     },
+    cache: 'no-store',
   });
 
   const payload = await upstream.json();
@@ -63,13 +65,12 @@ export async function GET(
 
     const answered = msg.is_answered === 1 || msg.is_answered === true;
     const answer = typeof msg.answer === 'string' ? msg.answer : '';
-    if (!answered || !answer) {
-      msg.sources = [];
-      continue;
-    }
-
     const rawSources = parseSources(msg.sources);
-    msg.sources = await enrichAnswerSources(auth, lastQuestion, answer, rawSources);
+
+    const resolved = await resolveSessionMessage(auth, lastQuestion, answer, answered, rawSources);
+    msg.answer = resolved.answer;
+    msg.is_answered = resolved.is_answered ? 1 : 0;
+    msg.sources = resolved.sources;
   }
 
   payload.data = data;

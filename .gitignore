@@ -41,6 +41,6 @@ next-env.d.ts
 /nautilusapi/uploads/*
 !/nautilusapi/uploads/.gitkeep
 /nautilusapi/config/secrets.php
-# Local API deploy package (regenerate from nautilusapi/ when needed)
-/nautilus-api-sources-fix.zip
+# Local document title/category overrides (dev fallback)
+/data/document-overrides.json
 

@@ -159,6 +159,14 @@ class ChatController {
         try {
             $llm    = new LLMService();
             $result = $llm->answerWithFallback($question, $allChunks, $chunks);
+
+            if (!$result['answered']) {
+                $recovered = $this->recoverAnswerFromChunks($question, $chunks, $allChunks);
+                if ($recovered !== null) {
+                    $result = $recovered;
+                    Logger::info('[chat-response] recovered answer from retrieved chunk after LLM not-found');
+                }
+            }
         } catch (Throwable $e) {
             Logger::error('LLM failed: ' . $e->getMessage());
             $cfg = require __DIR__ . '/../../../config/config.php';
@@ -244,6 +252,78 @@ class ChatController {
             'query_id'    => $queryId ? (int) $queryId : null,
             'from_cache'  => false,
         ]);
+    }
+
+    /**
+     * Locate the best source page(s) for a question using indexed document_chunks.
+     * page_number values match the PDF viewer (#page=N) because ingestion uses pdftotext.
+     */
+    public function locateSource(array $params = []): void {
+        $user = AuthMiddleware::require();
+        unset($user);
+
+        $question   = trim(strip_tags(Request::get('q') ?? Request::get('question') ?? ''));
+        $answer     = trim(strip_tags(Request::get('answer') ?? ''));
+        $documentId = Request::get('document_id') ? (int) Request::get('document_id') : null;
+
+        if (mb_strlen($question) < 3) {
+            Response::error('Question too short', 422);
+            return;
+        }
+
+        $cfg       = require __DIR__ . '/../../../config/config.php';
+        $retrieval = $this->retrieveChunks($question, null, 20);
+        $chunks    = $retrieval['for_fallback'];
+
+        $chunks = array_values(array_filter(
+            $chunks,
+            fn($c) => !DocumentParser::isTableOfContentsChunk($c['content'] ?? '')
+        ));
+
+        if ($documentId) {
+            $chunks = array_values(array_filter(
+                $chunks,
+                fn($c) => (int) ($c['document_id'] ?? 0) === $documentId
+            ));
+        }
+
+        if (empty($chunks)) {
+            Response::success(['sources' => []]);
+            return;
+        }
+
+        $headingQuery = mb_strlen($question) < 100 && !str_ends_with($question, '?');
+        $attributeOn  = ($headingQuery || $answer === '') ? $question : $answer;
+
+        $sources = SourceAttributor::attribute($attributeOn, $question, $chunks);
+
+        if (empty($sources)) {
+            $sources = [SourceAttributor::chunkToSource($chunks[0], 1)];
+        }
+
+        foreach ($sources as &$src) {
+            $page = (int) ($src['page_number'] ?? $src['pageNumber'] ?? 0);
+            if ($page > 0) {
+                $src['page_label'] = 'Page ' . $page;
+                $src['pageLabel']  = 'Page ' . $page;
+            }
+        }
+        unset($src);
+
+        Response::success(['sources' => $this->enrichSources($sources)]);
+    }
+
+    private static function extractPrintedPageFromText(string $text): ?int {
+        if (preg_match('/Page\s+Number\s*:\s*Page\s*(\d+)\s+of\s+\d+/i', $text, $m)) {
+            return (int) $m[1];
+        }
+        if (preg_match('/Page\s+Number\s*:\s*(\d+)/i', $text, $m)) {
+            return (int) $m[1];
+        }
+        if (preg_match('/Page\s+(\d+)\s+of\s+\d+/i', $text, $m)) {
+            return (int) $m[1];
+        }
+        return null;
     }
 
     public function sessions(array $params = []): void {
@@ -698,6 +778,73 @@ class ChatController {
         }
 
         return $merged;
+    }
+
+    /**
+     * When the LLM returns "not found" but retrieval surfaced a substantive chunk,
+     * quote the best matching passage so users still get document-backed answers.
+     *
+     * @param array<int, array<string, mixed>> $chunks
+     * @param array<int, array<string, mixed>> $allChunks
+     */
+    private function recoverAnswerFromChunks(string $question, array $chunks, array $allChunks): ?array {
+        if (empty($chunks)) {
+            return null;
+        }
+
+        $reranker = new ChunkReranker();
+        $ranked   = $reranker->rerank($chunks, $question);
+
+        foreach ($ranked as $chunk) {
+            $content = trim((string) ($chunk['content'] ?? ''));
+            if (mb_strlen($content) < 80) {
+                continue;
+            }
+            if (DocumentParser::isTableOfContentsChunk($content)) {
+                continue;
+            }
+
+            $score = (float) ($chunk['rerank_score'] ?? 0);
+            if ($score < 0.15) {
+                continue;
+            }
+
+            $sentences = preg_split('/[.!?]+/u', $content, -1, PREG_SPLIT_NO_EMPTY) ?: [];
+            $parts     = [];
+            foreach ($sentences as $sentence) {
+                $sentence = trim($sentence);
+                if (mb_strlen($sentence) < 20) {
+                    continue;
+                }
+                $parts[] = $sentence;
+                if (mb_strlen(implode('. ', $parts)) >= 420) {
+                    break;
+                }
+            }
+
+            $answer = trim(implode('. ', $parts));
+            if ($answer !== '' && !str_ends_with($answer, '.')) {
+                $answer .= '.';
+            }
+            if (mb_strlen($answer) < 40) {
+                continue;
+            }
+
+            $sources = SourceAttributor::ensureNonEmptySources(
+                [SourceAttributor::chunkToSource($chunk, 1)],
+                $chunks,
+                $allChunks
+            );
+
+            return [
+                'answer'     => $answer,
+                'sources'    => $sources,
+                'confidence' => 0.65,
+                'answered'   => true,
+            ];
+        }
+
+        return null;
     }
 
     private function persistMessage(

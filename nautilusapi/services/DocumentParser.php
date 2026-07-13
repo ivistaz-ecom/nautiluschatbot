@@ -8,68 +8,158 @@ class DocumentParser {
      * Returns array: [page_number => text] where keys are 1-based original PDF page numbers.
      * These keys must be preserved when chunking so retrieval can deep-link with #page=N.
      */
-    //sibi
     public function parsePdf(string $path): array {
+        require_once __DIR__ . '/../core/Logger.php';
 
-    require_once __DIR__ . '/../core/Logger.php';
+        Logger::info('========== PDF PARSER START ==========');
+        Logger::info('File : ' . $path);
 
-    Logger::info("========== PDF PARSER START ==========");
-    Logger::info("File : " . $path);
+        $candidates = [];
 
-    // 1. Try Poppler
-    if ($this->commandExists('pdftotext')) {
-
-        Logger::info("Using pdftotext");
+        if ($this->commandExists('pdftotext')) {
+            foreach (['-layout', '-raw', ''] as $mode) {
+                try {
+                    $pages = $this->runPdftotext($path, $mode);
+                    $chars = self::countMeaningfulChars($pages);
+                    Logger::info('[PDF_TRY] pdftotext ' . ($mode ?: 'default') . " chars=$chars pages=" . count($pages));
+                    $candidates[] = ['label' => 'pdftotext ' . ($mode ?: 'default'), 'pages' => $pages, 'chars' => $chars];
+                } catch (Exception $e) {
+                    Logger::info('[PDF_TRY] pdftotext ' . ($mode ?: 'default') . ' failed: ' . $e->getMessage());
+                }
+            }
+        }
 
         try {
-
-            $pages = $this->parsePdfWithPoppler($path);
-
-            Logger::info("pdftotext returned " . count($pages) . " pages");
-
-            return $pages;
-
+            $pages = $this->parsePdfPhp($path);
+            $chars = self::countMeaningfulChars($pages);
+            Logger::info("[PDF_TRY] PHP parser chars=$chars pages=" . count($pages));
+            $candidates[] = ['label' => 'php', 'pages' => $pages, 'chars' => $chars];
         } catch (Exception $e) {
-
-            Logger::info("pdftotext FAILED");
-
-            Logger::info($e->getMessage());
-
+            Logger::info('[PDF_TRY] PHP parser failed: ' . $e->getMessage());
         }
+
+        $best = self::pickBestCandidate($candidates);
+
+        if ($best !== null && $best['chars'] >= 50) {
+            Logger::info('[PDF_BEST] Using ' . $best['label'] . ' chars=' . $best['chars']);
+            return $best['pages'];
+        }
+
+        if ($this->commandExists('pdftoppm') && $this->commandExists('tesseract')) {
+            Logger::info('Using OCR fallback');
+            try {
+                $pages = $this->parsePdfWithOcr($path);
+                $chars = self::countMeaningfulChars($pages);
+                Logger::info("[PDF_TRY] OCR chars=$chars pages=" . count($pages));
+                if ($chars >= 50) {
+                    return $pages;
+                }
+                $candidates[] = ['label' => 'ocr', 'pages' => $pages, 'chars' => $chars];
+            } catch (Exception $e) {
+                Logger::info('[PDF_TRY] OCR failed: ' . $e->getMessage());
+            }
+        }
+
+        $best = self::pickBestCandidate($candidates);
+        if ($best !== null && $best['chars'] > 0) {
+            Logger::info('[PDF_BEST] Using weak result from ' . $best['label'] . ' chars=' . $best['chars']);
+            return $best['pages'];
+        }
+
+        return [1 => 'No extractable text found (may be a scanned PDF)'];
     }
 
-    // 2. Try OCR
-    if ($this->commandExists('pdftoppm') && $this->commandExists('tesseract')) {
-
-        Logger::info("Using OCR");
-
-        try {
-
-            $pages = $this->parsePdfWithOcr($path);
-
-            Logger::info("OCR returned " . count($pages) . " pages");
-
-            return $pages;
-
-        } catch (Exception $e) {
-
-            Logger::info("OCR FAILED");
-
-            Logger::info($e->getMessage());
-
+    /** Count non-whitespace characters across all pages (images are ignored by text extractors). */
+    public static function countMeaningfulChars(array $pages): int {
+        $total = 0;
+        foreach ($pages as $text) {
+            $trimmed = trim((string) $text);
+            if ($trimmed === '') {
+                continue;
+            }
+            $total += strlen(preg_replace('/\s+/', '', $trimmed));
         }
+        return $total;
     }
 
-    Logger::info("Using PHP parser");
+    /**
+     * @param  array<int, array{label: string, pages: array<int, string>, chars: int}> $candidates
+     * @return array{label: string, pages: array<int, string>, chars: int}|null
+     */
+    private static function pickBestCandidate(array $candidates): ?array {
+        $best = null;
+        foreach ($candidates as $candidate) {
+            if ($best === null || $candidate['chars'] > $best['chars']) {
+                $best = $candidate;
+            }
+        }
+        return $best;
+    }
 
-    $pages = $this->parsePdfPhp($path);
+    /**
+     * Run pdftotext with optional flags. Images in the PDF are skipped automatically.
+     */
+    private function runPdftotext(string $path, string $flags = '-layout'): array {
+        $tmpBase = sys_get_temp_dir() . '/nautilus_pdf_' . uniqid();
+        $envPath = $this->getShellPath();
+        $flagStr = $flags !== '' ? $flags . ' ' : '';
+        $cmd     = sprintf(
+            'PATH=%s pdftotext %s-enc UTF-8 %s %s.txt 2>/dev/null',
+            escapeshellarg($envPath),
+            $flagStr,
+            escapeshellarg($path),
+            escapeshellarg($tmpBase)
+        );
 
-    Logger::info("PHP parser returned " . count($pages) . " pages");
+        require_once __DIR__ . '/../core/Logger.php';
+        Logger::info('[PDF_CMD] ' . $cmd);
 
-    return $pages;
-}
+        exec($cmd, $out, $code);
 
-//Sibi
+        $txtFile = $tmpBase . '.txt';
+        if (!file_exists($txtFile)) {
+            throw new RuntimeException("pdftotext failed for: $path");
+        }
+
+        $text = (string) file_get_contents($txtFile);
+        @unlink($txtFile);
+
+        if (trim($text) === '') {
+            throw new RuntimeException('pdftotext produced empty output');
+        }
+
+        return $this->splitPdftotextPages($text, $path);
+    }
+
+    /**
+     * Split pdftotext output into 1-based page map aligned with the PDF viewer.
+     */
+    private function splitPdftotextPages(string $text, string $path): array {
+        $rawPages = explode("\f", $text);
+        $pages    = [];
+
+        foreach ($rawPages as $i => $page) {
+            $pages[$i + 1] = trim($page);
+        }
+
+        while (!empty($pages) && end($pages) === '') {
+            array_pop($pages);
+        }
+
+        if (empty($pages)) {
+            throw new RuntimeException('No pages after split');
+        }
+
+        $expected = $this->getPdfPageCount($path);
+        $got      = count($pages);
+
+        // If form-feed split missed pages, retry with -raw for this caller only when severely short.
+        if ($expected !== null && $expected >= 3 && $got < (int) floor($expected * 0.5)) {
+            Logger::info("[PDF_SPLIT] page mismatch got=$got expected=$expected for " . basename($path));
+        }
+
+        return $pages;
+    }
 
     /**
      * Parse DOCX using PHP ZipArchive + XML parsing (no library needed).
@@ -591,22 +681,43 @@ foreach ($rawPages as $i => $page) {
     }
 
     private function extractPdfText(string $stream): string {
-        // Extract text between BT/ET markers
         preg_match_all('/BT(.*?)ET/s', $stream, $blocks);
         $lines = [];
 
         foreach ($blocks[1] as $block) {
-            // Match Tj, TJ, and ' operators
-            preg_match_all('/\(([^)]*)\)\s*Tj|\[([^\]]*)\]\s*TJ/', $block, $texts);
-
-            foreach ($texts[1] as $t) {
-                if (trim($t)) $lines[] = $this->decodePdfString($t);
+            // (text) Tj
+            if (preg_match_all('/\((?:[^\\\\\)]|\\\\.)*\)\s*Tj/s', $block, $tj)) {
+                foreach ($tj[0] as $match) {
+                    if (preg_match('/\((.*)\)\s*Tj/s', $match, $m)) {
+                        $decoded = $this->decodePdfString($m[1]);
+                        if (trim($decoded) !== '') {
+                            $lines[] = $decoded;
+                        }
+                    }
+                }
             }
-            foreach ($texts[2] as $t) {
-                // TJ array: extract string elements
-                preg_match_all('/\(([^)]*)\)/', $t, $tj);
-                foreach ($tj[1] as $s) {
-                    if (trim($s)) $lines[] = $this->decodePdfString($s);
+
+            // [ (...) ... ] TJ
+            if (preg_match_all('/\[([^\]]*)\]\s*TJ/s', $block, $tjArrays)) {
+                foreach ($tjArrays[1] as $array) {
+                    if (preg_match_all('/\((?:[^\\\\\)]|\\\\.)*\)/s', $array, $parts)) {
+                        foreach ($parts[0] as $part) {
+                            $decoded = $this->decodePdfString(trim($part, '()'));
+                            if (trim($decoded) !== '') {
+                                $lines[] = $decoded;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // <48656c6c6f> Tj hex strings
+            if (preg_match_all('/<([0-9A-Fa-f]+)>\s*Tj/', $block, $hex)) {
+                foreach ($hex[1] as $h) {
+                    $decoded = $this->decodePdfHexString($h);
+                    if (trim($decoded) !== '') {
+                        $lines[] = $decoded;
+                    }
                 }
             }
         }
@@ -614,16 +725,38 @@ foreach ($rawPages as $i => $page) {
         return implode(' ', $lines);
     }
 
+    private function decodePdfHexString(string $hex): string {
+        $hex = preg_replace('/\s+/', '', $hex);
+        if ($hex === '' || strlen($hex) % 2 !== 0) {
+            return '';
+        }
+        $out = '';
+        for ($i = 0; $i < strlen($hex); $i += 2) {
+            $out .= chr(hexdec(substr($hex, $i, 2)));
+        }
+        return $out;
+    }
+
     private function decodePdfString(string $s): string {
-        // Handle basic PDF escape sequences
-        $s = str_replace(['\\n', '\\r', '\\t', '\\(', '\\)'], ["\n", "\r", "\t", '(', ')'], $s);
+        $s = preg_replace_callback('/\\\\([\\\\nrtbf()])/', function ($m) {
+            return match ($m[1]) {
+                'n' => "\n",
+                'r' => "\r",
+                't' => "\t",
+                'b' => "\x08",
+                'f' => "\x0C",
+                default => $m[1],
+            };
+        }, $s);
         return $s;
     }
 
     private function getShellPath(): string {
         $env_path = getenv('PATH') ?: '';
-        if (!str_contains($env_path, '/opt/homebrew/bin')) {
-            $env_path = '/opt/homebrew/bin:/usr/local/bin:' . $env_path;
+        foreach (['/usr/local/bin', '/usr/bin', '/opt/homebrew/bin'] as $binDir) {
+            if (!str_contains($env_path, $binDir)) {
+                $env_path = $binDir . ':' . $env_path;
+            }
         }
         return $env_path;
     }

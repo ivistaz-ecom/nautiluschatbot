@@ -1,5 +1,5 @@
 'use client';
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '@/lib/auth';
@@ -8,25 +8,39 @@ import { Mail, Lock, AlertCircle } from 'lucide-react';
 import { Logo } from '@/components/Logo';
 
 export default function LoginPage() {
-  const { login }  = useAuth();
-  const router     = useRouter();
-  const [email, setEmail]       = useState('');
+  const { login, user, loading: authLoading } = useAuth();
+  const router = useRouter();
+  const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [error, setError]       = useState('');
-  const [loading, setLoading]   = useState(false);
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (authLoading) return;
+    if (user?.role === 'admin') router.replace('/admin');
+    else if (user) router.replace('/chat');
+  }, [user, authLoading, router]);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError('');
     setLoading(true);
     try {
-      await login(email, password);
-      router.push('/chat');
+      const loggedIn = await login(email, password);
+      router.push(loggedIn.role === 'admin' ? '/admin' : '/chat');
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Login failed');
     } finally {
       setLoading(false);
     }
+  }
+
+  if (authLoading || user) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-brand">
+        <div className="w-6 h-6 border-2 border-white border-t-transparent rounded-full animate-spin" />
+      </div>
+    );
   }
 
   return (

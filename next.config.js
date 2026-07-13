@@ -8,6 +8,15 @@ const nextConfig = {
         ? '/api/proxy/v1'
         : 'https://nautilus.crafttechhub.com/api/v1'),
   },
+  async redirects() {
+    return [
+      {
+        source: '/favicon.ico',
+        destination: '/white-logo.webp',
+        permanent: false,
+      },
+    ];
+  },
 }
 
 module.exports = nextConfig

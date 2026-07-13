@@ -76,6 +76,7 @@ $router->get ('/auth/me',              [AuthController::class, 'me']);
 
 // ── CHAT ──────────────────────────────────────────────────────────
 $router->post  ('/chat/ask',                  [ChatController::class, 'ask']);
+$router->get   ('/chat/locate-source',        [ChatController::class, 'locateSource']);
 $router->get   ('/chat/sessions',             [ChatController::class, 'sessions']);
 $router->get   ('/chat/sessions/:id',         [ChatController::class, 'session']);
 $router->delete('/chat/sessions/:id',         [ChatController::class, 'deleteSession']);
@@ -88,8 +89,12 @@ $router->get   ('/chat/documents/:id/file',   [DocumentController::class, 'serve
 $router->get   ('/admin/documents',           [DocumentController::class, 'index']);
 $router->post  ('/admin/documents',           [DocumentController::class, 'upload']);
 $router->get   ('/admin/documents/:id',       [DocumentController::class, 'show']);
+$router->put   ('/admin/documents/:id',       [DocumentController::class, 'update']);
+$router->post  ('/admin/documents/:id/update',[DocumentController::class, 'update']);
+$router->get   ('/admin/documents/:id/file',  [DocumentController::class, 'serveAdminFile']);
 $router->delete('/admin/documents/:id',       [DocumentController::class, 'delete']);
-$router->post  ('/admin/documents/:id/reparse',[DocumentController::class,'reparse']);
+$router->post  ('/admin/documents/:id/reparse',     [DocumentController::class,'reparse']);
+$router->post  ('/admin/documents/:id/ingest-pages',[DocumentController::class,'ingestPages']);
 
 // ── ADMIN ─────────────────────────────────────────────────────────
 $router->get   ('/admin/categories',          [AdminController::class, 'categoriesIndex']);
@@ -153,6 +158,10 @@ $router->get('/health/llm', function() {
 
 $router->get('/health/document-file', function() {
     Response::success(['document_file_route' => true]);
+});
+
+$router->get('/health/document-update', function() {
+    Response::success(['document_update_route' => true]);
 });
 
 // ── Dispatch ──────────────────────────────────────────────────────

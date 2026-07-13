@@ -88,8 +88,15 @@ class DocumentController {
             [$docId, 'queued']
         );
 
-        // Parse immediately so documents are searchable without a background worker
-        $this->parseDocument((int) $docId, $storedPath, $mime);
+        // Parse immediately unless the client will send pages in a follow-up request.
+        $skipServerParse = Request::post('skip_server_parse') === '1';
+        $parsedPages     = $this->resolveParsedPagesFromRequest();
+
+        if ($skipServerParse && $parsedPages === null) {
+            Logger::info("[DOC_PARSE] skip_server_parse=1 for document $docId — waiting for ingest-pages");
+        } else {
+            $this->parseDocument((int) $docId, $storedPath, $mime, $parsedPages);
+        }
 
         $doc = Database::queryOne(
             'SELECT status, error_message, page_count FROM documents WHERE id = ?',
@@ -138,7 +145,8 @@ class DocumentController {
         )['c'];
 
         $rows = Database::query(
-            "SELECT d.*, c.name AS category_name, u.name AS uploaded_by_name
+            "SELECT d.*, c.name AS category_name, u.name AS uploaded_by_name,
+                    (SELECT COUNT(*) FROM document_chunks dc WHERE dc.document_id = d.id) AS chunk_count
              FROM documents d
              JOIN categories c ON c.id = d.category_id
              JOIN users u ON u.id = d.uploaded_by
@@ -160,17 +168,27 @@ class DocumentController {
         Response::paginated($rows, (int) $total, $page, $perPage);
     }
 
+    /** Stream a document file for admins (any status — used for re-parse in Node BFF). */
+    public function serveAdminFile(array $params): void {
+        AuthMiddleware::requireAdmin();
+        $this->streamDocumentFile((int) ($params['id'] ?? 0), false);
+    }
+
     /** Stream a document file for authenticated chat users (inline PDF/DOCX view). */
     public function serveFile(array $params): void {
         $jwt = Request::bearerToken() ?? Request::get('token');
         AuthMiddleware::requireToken(is_string($jwt) ? $jwt : null);
+        $this->streamDocumentFile((int) ($params['id'] ?? 0), true);
+    }
+
+    private function streamDocumentFile(int $id, bool $readyOnly): void {
         $cfg = require __DIR__ . '/../../../config/config.php';
 
-        $id  = (int) ($params['id'] ?? 0);
-        $doc = Database::queryOne(
-            "SELECT storage_path, mime_type, original_filename, status FROM documents WHERE id = ? AND status = 'ready'",
-            [$id]
-        );
+        $sql = $readyOnly
+            ? "SELECT storage_path, mime_type, original_filename, status FROM documents WHERE id = ? AND status = 'ready'"
+            : 'SELECT storage_path, mime_type, original_filename, status FROM documents WHERE id = ?';
+
+        $doc = Database::queryOne($sql, [$id]);
 
         if (!$doc) {
             Response::error('Document not found', 404);
@@ -259,6 +277,63 @@ class DocumentController {
         Response::success($doc);
     }
 
+    public function update(array $params): void {
+        AuthMiddleware::requireAdmin();
+        $id = (int) ($params['id'] ?? 0);
+
+        if (!Database::queryOne('SELECT id FROM documents WHERE id = ?', [$id])) {
+            Response::error('Document not found', 404);
+            return;
+        }
+
+        $title = trim((string) (Request::input('title') ?? ''));
+        $originalFilename = trim((string) (Request::input('original_filename') ?? ''));
+        $categoryId = (int) (Request::input('category_id') ?? 0);
+
+        if ($title === '') {
+            Response::error('Document name is required', 422);
+            return;
+        }
+
+        if ($categoryId <= 0 || !Database::queryOne('SELECT id FROM categories WHERE id = ?', [$categoryId])) {
+            Response::error('Invalid category', 422);
+            return;
+        }
+
+        if (strlen($title) > 255) {
+            Response::error('Document name must not exceed 255 characters', 422);
+            return;
+        }
+
+        if ($originalFilename !== '' && strlen($originalFilename) > 255) {
+            Response::error('File name must not exceed 255 characters', 422);
+            return;
+        }
+
+        if ($originalFilename !== '') {
+            $originalFilename = preg_replace('/[^\w\s.\-()]/', '_', $originalFilename);
+        }
+
+        if ($originalFilename !== '') {
+            Database::execute(
+                'UPDATE documents SET title = ?, category_id = ?, original_filename = ?, updated_at = NOW() WHERE id = ?',
+                [$title, $categoryId, $originalFilename, $id]
+            );
+        } else {
+            Database::execute(
+                'UPDATE documents SET title = ?, category_id = ?, updated_at = NOW() WHERE id = ?',
+                [$title, $categoryId, $id]
+            );
+        }
+
+        $doc = Database::queryOne(
+            'SELECT d.*, c.name AS category_name FROM documents d JOIN categories c ON c.id = d.category_id WHERE d.id = ?',
+            [$id]
+        );
+
+        Response::success($doc, 'Document updated');
+    }
+
     public function delete(array $params): void {
         AuthMiddleware::requireAdmin();
         $id  = (int) ($params['id'] ?? 0);
@@ -293,23 +368,88 @@ class DocumentController {
         Database::execute('DELETE FROM document_chunks WHERE document_id = ?', [$id]);
         Database::execute("UPDATE documents SET status = 'pending', page_count = NULL WHERE id = ?", [$id]);
 
-        $this->parseDocument((int) $doc['id'], $doc['storage_path'], $doc['mime_type']);
+        $parsedPages = $this->resolveParsedPagesFromRequest();
+        $this->parseDocument((int) $doc['id'], $doc['storage_path'], $doc['mime_type'], $parsedPages);
 
-        Response::success(null, 'Re-parse triggered');
+        $doc = Database::queryOne(
+            'SELECT status, error_message, page_count FROM documents WHERE id = ?',
+            [$id]
+        );
+
+        Response::success(
+            [
+                'status'     => $doc['status'] ?? 'pending',
+                'page_count' => isset($doc['page_count']) ? (int) $doc['page_count'] : null,
+                'error'      => $doc['error_message'] ?? null,
+            ],
+            ($doc['status'] ?? '') === 'ready' ? 'Document re-indexed successfully.' : 'Re-parse completed'
+        );
+    }
+
+    /** Index a document from client-extracted per-page text (JSON body). */
+    public function ingestPages(array $params): void {
+        AuthMiddleware::requireAdmin();
+        $id  = (int) ($params['id'] ?? 0);
+        $doc = Database::queryOne(
+            'SELECT id, storage_path, mime_type FROM documents WHERE id = ?',
+            [$id]
+        );
+
+        if (!$doc) {
+            Response::error('Document not found', 404);
+            return;
+        }
+
+        $parsedPages = $this->resolveParsedPagesFromRequest();
+        if ($parsedPages === null || count($parsedPages) === 0) {
+            Response::error('pages object is required', 400);
+            return;
+        }
+
+        Database::execute('DELETE FROM document_chunks WHERE document_id = ?', [$id]);
+        Database::execute(
+            "UPDATE documents SET status = 'pending', page_count = NULL, error_message = NULL WHERE id = ?",
+            [$id]
+        );
+
+        $this->parseDocument((int) $doc['id'], $doc['storage_path'], $doc['mime_type'], $parsedPages);
+
+        $updated = Database::queryOne(
+            'SELECT status, error_message, page_count FROM documents WHERE id = ?',
+            [$id]
+        );
+
+        Response::success(
+            [
+                'status'     => $updated['status'] ?? 'pending',
+                'page_count' => isset($updated['page_count']) ? (int) $updated['page_count'] : null,
+                'error'      => $updated['error_message'] ?? null,
+            ],
+            ($updated['status'] ?? '') === 'ready'
+                ? 'Document indexed successfully.'
+                : 'Indexing failed: ' . ($updated['error_message'] ?? 'unknown error')
+        );
     }
 
     // ── Internal parse ─────────────────────────────────────────────
 
-    private function parseDocument(int $docId, string $path, string $mime): void {
+    private function parseDocument(int $docId, string $path, string $mime, ?array $preparsedPages = null): void {
         try {
             Database::execute("UPDATE documents SET status = 'processing' WHERE id = ?", [$docId]);
             Database::execute("UPDATE document_jobs SET status = 'processing', attempts = attempts + 1 WHERE document_id = ?", [$docId]);
 
-            Logger::info('Starting PDF parse ' . json_encode(['file' => $path]));
+            Logger::info('Starting PDF parse ' . json_encode(['file' => $path, 'preparsed' => $preparsedPages !== null]));
+
             $parser = new DocumentParser();
-            $pages  = $mime === 'application/pdf'
-                ? $parser->parsePdf($path)
-                : $parser->parseDocx($path);
+
+            if ($preparsedPages !== null && count($preparsedPages) > 0) {
+                $pages = $preparsedPages;
+                Logger::info('[DOC_PARSE] Using parsed_pages from upload request, count=' . count($pages));
+            } else {
+                $pages = $mime === 'application/pdf'
+                    ? $parser->parsePdf($path)
+                    : $parser->parseDocx($path);
+            }
 
             Logger::info('PDF parsed ' . json_encode(['pages_detected' => count($pages)]));
             foreach ($pages as $pageNumber => $pageText) {
@@ -416,8 +556,75 @@ class DocumentController {
             $totalChars += strlen($trimmed);
         }
 
-        if ($totalChars < 50) {
+        if ($totalChars < 30) {
             throw new RuntimeException('Could not extract enough text from the document to index it.');
         }
+    }
+
+    /**
+     * @return array<int, string>|null
+     */
+    private function resolveParsedPagesFromRequest(): ?array {
+        $pages = $this->decodeParsedPages(Request::post('parsed_pages'));
+        if ($pages !== null) {
+            return $pages;
+        }
+
+        $file = Request::file('parsed_pages_file');
+        if (is_array($file) && ($file['error'] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_OK) {
+            $raw = file_get_contents($file['tmp_name']);
+            $pages = $this->decodeParsedPages(is_string($raw) ? $raw : null);
+            if ($pages !== null) {
+                return $pages;
+            }
+        }
+
+        $body = Request::body();
+        if (isset($body['pages']) && is_array($body['pages'])) {
+            return $this->decodeParsedPages(json_encode($body['pages']));
+        }
+
+        return null;
+    }
+
+    /**
+     * @return array<int, string>|null
+     */
+    private function decodeParsedPages(mixed $raw): ?array {
+        if ($raw === null) {
+            return null;
+        }
+
+        if (is_array($raw)) {
+            $decoded = $raw;
+        } else {
+            $text = trim((string) $raw);
+            if ($text === '') {
+                return null;
+            }
+            $decoded = json_decode($text, true);
+            if (!is_array($decoded)) {
+                Logger::warn('[DOC_PARSE] parsed_pages JSON invalid');
+                return null;
+            }
+        }
+
+        $pages = [];
+        foreach ($decoded as $pageNum => $text) {
+            $num = (int) $pageNum;
+            if ($num <= 0 || !is_string($text)) {
+                continue;
+            }
+            $pages[$num] = trim($text);
+        }
+
+        if (count($pages) === 0) {
+            return null;
+        }
+
+        Logger::info('[DOC_PARSE] decoded parsed_pages count=' . count($pages)
+            . ' chars=' . DocumentParser::countMeaningfulChars($pages));
+
+        return $pages;
     }
 }
