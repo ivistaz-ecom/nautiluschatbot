@@ -3,9 +3,24 @@ import { API_BACKEND_URL } from '@/lib/api-config';
 
 type RouteContext = { params: { path: string[] } };
 
+function isAllowedProxyRequest(req: NextRequest): boolean {
+  const origin = req.headers.get('origin');
+  if (!origin) return true;
+
+  const host = req.headers.get('host');
+  if (!host) return false;
+
+  try {
+    const originHost = new URL(origin).host;
+    return originHost === host;
+  } catch {
+    return false;
+  }
+}
+
 async function proxy(req: NextRequest, { params }: RouteContext) {
-  if (process.env.NODE_ENV !== 'development') {
-    return NextResponse.json({ success: false, message: 'Not found' }, { status: 404 });
+  if (!isAllowedProxyRequest(req)) {
+    return NextResponse.json({ success: false, message: 'Forbidden' }, { status: 403 });
   }
 
   const path = params.path.join('/');
@@ -45,7 +60,7 @@ async function proxy(req: NextRequest, { params }: RouteContext) {
     });
   } catch {
     return NextResponse.json(
-      { success: false, message: 'Dev API proxy unavailable. Restart npm run dev.' },
+      { success: false, message: 'API proxy unavailable. Check API_BACKEND_URL on the server.' },
       { status: 502 }
     );
   }
