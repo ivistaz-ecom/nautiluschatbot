@@ -8,7 +8,7 @@ interface AuthContextType {
   user: User | null;
   token: string | null;
   loading: boolean;
-  login: (email: string, password: string) => Promise<void>;
+  login: (email: string, password: string) => Promise<User>;
   logout: () => void;
 }
 
@@ -37,6 +37,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     localStorage.setItem('nk_token', res.data.token);
     setToken(res.data.token);
     setUser(res.data.user);
+    return res.data.user;
   }
 
   function logout() {

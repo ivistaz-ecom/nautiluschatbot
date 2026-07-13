@@ -1,0 +1,45 @@
+Options -Indexes
+Options -MultiViews
+
+RewriteEngine On
+
+# Pass Authorization header to PHP (Apache strips it by default on CGI/FastCGI)
+RewriteCond %{HTTP:Authorization} .
+RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+
+# ── STEP 1: Handle OPTIONS preflight FIRST before any other rules ──
+RewriteCond %{REQUEST_METHOD} OPTIONS
+RewriteRule ^(.*)$ - [R=200,L]
+
+# ── STEP 2: Block sensitive directories and files ──
+RewriteRule ^(config|core|middleware|services|models|logs|cache|uploads)/ - [F,L]
+<Files ".env">
+    Require all denied
+</Files>
+
+# ── STEP 3: Route API requests through index.php ──
+# Do NOT skip when a matching directory exists on disk — otherwise paths like
+# /admin/categories hit real folders, get a trailing-slash 301, then 403.
+# IMPORTANT: Do NOT add .htaccess files inside api/v1/auth|admin|chat|documents/
+# — they rewrite to a local index.php that does not exist and break all routes.
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteRule ^ index.php [QSA,L]
+
+# ── CORS Headers (must be set on ALL responses including OPTIONS) ──
+Header always set Access-Control-Allow-Origin "*"
+Header always set Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS"
+Header always set Access-Control-Allow-Headers "Content-Type, Authorization, X-Requested-With"
+Header always set Access-Control-Allow-Credentials "true"
+Header always set Access-Control-Max-Age "86400"
+
+# ── Security headers ──
+Header always set X-Content-Type-Options "nosniff"
+Header always set X-Frame-Options "DENY"
+Header always set X-XSS-Protection "1; mode=block"
+Header always set Referrer-Policy "strict-origin-when-cross-origin"
+
+# ── PHP limits ──
+php_value upload_max_filesize 50M
+php_value post_max_size 55M
+php_value memory_limit 256M
+php_value max_execution_time 120

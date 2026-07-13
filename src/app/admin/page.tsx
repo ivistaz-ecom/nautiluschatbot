@@ -1,148 +1,144 @@
 'use client';
 import { useState, useEffect } from 'react';
-import Link from 'next/link';
-import { useAuth } from '@/lib/auth';
-import { useRouter } from 'next/navigation';
-import { api, Metrics } from '@/lib/api';
+import { api, Metrics, KnowledgeHealthReport } from '@/lib/api';
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer
 } from 'recharts';
 import {
-  Users, MessageSquare, FileText, AlertTriangle, TrendingUp,
-  Shield, FolderOpen, LogOut, HelpCircle
+  Users, MessageSquare, AlertTriangle, TrendingUp, Database,
 } from 'lucide-react';
-import { Logo } from '@/components/Logo';
+import Link from 'next/link';
 
 export default function AdminDashboard() {
-  const { user, logout, loading } = useAuth();
-  const router = useRouter();
   const [metrics, setMetrics] = useState<Metrics | null>(null);
+  const [health, setHealth] = useState<KnowledgeHealthReport | null>(null);
   const [loadingMetrics, setLoadingMetrics] = useState(true);
 
   useEffect(() => {
-    if (!loading && (!user || user.role !== 'admin')) router.push('/login');
-  }, [user, loading, router]);
+    Promise.all([
+      api.admin.metrics().then((r) => setMetrics(r.data)),
+      api.admin.knowledgeHealth().then((r) => setHealth(r.data)).catch(() => setHealth(null)),
+    ]).finally(() => setLoadingMetrics(false));
+  }, []);
 
-  useEffect(() => {
-    if (user?.role === 'admin') {
-      api.admin.metrics()
-        .then(r => setMetrics(r.data))
-        .finally(() => setLoadingMetrics(false));
-    }
-  }, [user]);
-
-  if (loading || loadingMetrics) return (
-    <div className="min-h-screen flex items-center justify-center bg-brand">
-      <div className="w-6 h-6 border-2 border-white border-t-transparent rounded-full animate-spin" />
-    </div>
-  );
-
-  const navLinks = [
-    { href: '/admin', label: 'Dashboard', icon: TrendingUp },
-    { href: '/admin/documents', label: 'Documents', icon: FileText },
-    { href: '/admin/categories', label: 'Categories', icon: FolderOpen },
-    { href: '/admin/users', label: 'Users', icon: Users },
-    { href: '/admin/whitelist', label: 'URL Whitelist', icon: Shield },
-    { href: '/admin/queries', label: 'Unanswered', icon: HelpCircle, badge: metrics?.unanswered_open },
-    { href: '/admin/questions', label: 'All Questions', icon: MessageSquare },
-  ];
+  if (loadingMetrics) {
+    return (
+      <div className="flex items-center justify-center h-full">
+        <div className="w-6 h-6 border-2 border-white border-t-transparent rounded-full animate-spin" />
+      </div>
+    );
+  }
 
   return (
-    <div className="flex h-screen bg-brand">
-      {/* Sidebar */}
-      <aside className="w-60 bg-brand border-r border-white/10 flex flex-col flex-shrink-0">
-        <div className="px-4 py-5 border-b border-white/10">
-          <Logo size="sm" />
-          <p className="text-white/50 text-xs mt-1 pl-1">Admin Panel</p>
-        </div>
+    <div className="px-8 py-6">
+      <h1 className="text-xl font-bold text-white mb-1">Dashboard</h1>
+      <p className="text-white/50 text-sm mb-8">Knowledge Base overview</p>
 
-        <nav className="flex-1 px-3 py-4 space-y-1">
-          {navLinks.map(({ href, label, icon: Icon, badge }) => (
-            <Link key={href} href={href} className="flex items-center gap-3 px-3 py-2 text-white/70 hover:bg-white/10 hover:text-white rounded-lg text-sm transition-colors group">
-              <Icon className="w-4 h-4 flex-shrink-0" />
-              <span className="flex-1">{label}</span>
-              {badge ? (
-                <span className="bg-red-500 text-white text-xs px-1.5 py-0.5 rounded-full min-w-[20px] text-center">
-                  {badge}
-                </span>
-              ) : null}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+        <MetricCard label="Total Users" value={metrics?.total_users ?? 0} icon={Users} color="blue" sub={`${metrics?.new_users_30d} new this month`} />
+        <MetricCard label="Questions Today" value={metrics?.questions_today ?? 0} icon={MessageSquare} color="purple" sub={`${metrics?.total_questions} total`} />
+        <MetricCard label="Answer Rate" value={`${metrics?.answer_rate_pct ?? 0}%`} icon={TrendingUp} color="green" sub="last 30 days" />
+        <MetricCard label="Open Queries" value={metrics?.unanswered_open ?? 0} icon={AlertTriangle} color="amber" sub="need admin reply" />
+      </div>
+
+      {health && (
+        <div className="card p-5 mb-8">
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-2">
+              <Database className="w-4 h-4 text-brand-accent" />
+              <h2 className="font-semibold text-white text-sm">Knowledge base indexing</h2>
+            </div>
+            <Link href="/admin/documents" className="text-xs text-brand-accent hover:underline">
+              View documents
             </Link>
-          ))}
-        </nav>
-
-        <div className="px-3 py-4 border-t border-white/10">
-          <Link href="/chat" className="flex items-center gap-3 px-3 py-2 text-white/70 hover:bg-white/10 rounded-lg text-sm">
-            <MessageSquare className="w-4 h-4" />User chat
-          </Link>
-          <button onClick={logout} className="flex items-center gap-3 px-3 py-2 text-white/70 hover:bg-white/10 rounded-lg text-sm w-full">
-            <LogOut className="w-4 h-4" />Sign out
-          </button>
-        </div>
-      </aside>
-
-      {/* Main */}
-      <main className="flex-1 overflow-auto">
-        <div className="px-8 py-6">
-          <h1 className="text-xl font-bold text-white mb-1">Dashboard</h1>
-          <p className="text-white/50 text-sm mb-8">Knowledge Base overview</p>
-
-          {/* Metric cards */}
-          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
-            <MetricCard label="Total Users" value={metrics?.total_users ?? 0} icon={Users} color="blue" sub={`${metrics?.new_users_30d} new this month`} />
-            <MetricCard label="Questions Today" value={metrics?.questions_today ?? 0} icon={MessageSquare} color="purple" sub={`${metrics?.total_questions} total`} />
-            <MetricCard label="Answer Rate" value={`${metrics?.answer_rate_pct ?? 0}%`} icon={TrendingUp} color="green" sub="last 30 days" />
-            <MetricCard label="Open Queries" value={metrics?.unanswered_open ?? 0} icon={AlertTriangle} color="amber" sub="need admin reply" />
           </div>
-
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            {/* Activity chart */}
-            <div className="card p-5 lg:col-span-2">
-              <h2 className="font-semibold text-white mb-4 text-sm">Daily activity (30 days)</h2>
-              <ResponsiveContainer width="100%" height={220}>
-                <BarChart data={metrics?.daily_activity ?? []}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.1)" />
-                  <XAxis dataKey="date" tick={{ fontSize: 10, fill: 'rgba(255,255,255,0.5)' }} tickFormatter={d => d.slice(5)} />
-                  <YAxis tick={{ fontSize: 10, fill: 'rgba(255,255,255,0.5)' }} />
-                  <Tooltip contentStyle={{ background: '#003d52', border: '1px solid rgba(255,255,255,0.1)', color: '#fff' }} />
-                  <Bar dataKey="count" fill="#0ea5c9" radius={[3, 3, 0, 0]} />
-                </BarChart>
-              </ResponsiveContainer>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
+            <div>
+              <p className="text-xs text-white/50">Ready PDFs</p>
+              <p className="text-xl font-bold text-white">{health.summary.ready_documents}</p>
             </div>
-
-            {/* Top FAQs */}
-            <div className="card p-5">
-              <h2 className="font-semibold text-white mb-4 text-sm">Top FAQs</h2>
-              <div className="space-y-3">
-                {(metrics?.top_faqs ?? []).slice(0, 8).map((faq, i) => (
-                  <div key={i} className="flex items-start gap-2">
-                    <span className="text-xs font-bold text-white/30 w-5 text-right flex-shrink-0 mt-0.5">{i + 1}</span>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-xs text-white/80 truncate">{faq.canonical_question}</p>
-                      <p className="text-xs text-white/40">{faq.ask_count}× asked</p>
-                    </div>
-                  </div>
-                ))}
-                {!metrics?.top_faqs?.length && <p className="text-xs text-white/40">No FAQs yet</p>}
-              </div>
+            <div>
+              <p className="text-xs text-white/50">Searchable chunks</p>
+              <p className="text-xl font-bold text-white">{health.summary.total_chunks}</p>
+            </div>
+            <div>
+              <p className="text-xs text-white/50">Partially indexed</p>
+              <p className={`text-xl font-bold ${health.summary.low_indexing > 0 ? 'text-amber-300' : 'text-white'}`}>
+                {health.summary.low_indexing}
+              </p>
+            </div>
+            <div>
+              <p className="text-xs text-white/50">Not indexed</p>
+              <p className={`text-xl font-bold ${health.summary.not_indexed > 0 ? 'text-red-300' : 'text-white'}`}>
+                {health.summary.not_indexed}
+              </p>
             </div>
           </div>
-
-          {/* Top categories */}
-          {metrics?.top_categories?.length ? (
-            <div className="card p-5 mt-6">
-              <h2 className="font-semibold text-white mb-4 text-sm">Top categories (30 days)</h2>
-              <div className="flex flex-wrap gap-3">
-                {metrics.top_categories.map((c, i) => (
-                  <div key={i} className="flex items-center gap-2 bg-white/10 rounded-lg px-3 py-2">
-                    <span className="text-sm font-medium text-white">{c.name}</span>
-                    <span className="text-xs text-white/50">{c.question_count} questions</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          ) : null}
+          {(health.summary.low_indexing > 0 || health.summary.not_indexed > 0) && (
+            <p className="text-xs text-amber-200/90">
+              Chat only searches indexed text. Re-parse any PDF with low chunk counts so answers come from the full document.
+            </p>
+          )}
+          {health.summary.ready_documents > 0 && health.summary.low_indexing === 0 && health.summary.not_indexed === 0 && (
+            <p className="text-xs text-green-300/90">
+              All ready documents are indexed. In chat, click a source badge to open the PDF at the cited page and verify the answer.
+            </p>
+          )}
         </div>
-      </main>
+      )}
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div className="card p-5 lg:col-span-2">
+          <h2 className="font-semibold text-white mb-4 text-sm">Daily activity (30 days)</h2>
+          <ResponsiveContainer width="100%" height={220}>
+            <BarChart data={metrics?.daily_activity ?? []}>
+              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.1)" />
+              <XAxis dataKey="date" tick={{ fontSize: 10, fill: 'rgba(255,255,255,0.5)' }} tickFormatter={(d) => d.slice(5)} />
+              <YAxis tick={{ fontSize: 10, fill: 'rgba(255,255,255,0.5)' }} />
+              <Tooltip
+                cursor={false}
+                contentStyle={{ background: '#003d52', border: '1px solid rgba(255,255,255,0.1)', color: '#fff' }}
+              />
+              <Bar
+                dataKey="count"
+                fill="#0ea5c9"
+                radius={[3, 3, 0, 0]}
+                activeBar={{ fill: '#38bdf8' }}
+              />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+
+        <div className="card p-5">
+          <h2 className="font-semibold text-white mb-4 text-sm">Top FAQs</h2>
+          <div className="space-y-3">
+            {(metrics?.top_faqs ?? []).slice(0, 8).map((faq, i) => (
+              <div key={i} className="flex items-start gap-2">
+                <span className="text-xs font-bold text-white/30 w-5 text-right flex-shrink-0 mt-0.5">{i + 1}</span>
+                <div className="flex-1 min-w-0">
+                  <p className="text-xs text-white/80 truncate">{faq.canonical_question}</p>
+                  <p className="text-xs text-white/40">{faq.ask_count}× asked</p>
+                </div>
+              </div>
+            ))}
+            {!metrics?.top_faqs?.length && <p className="text-xs text-white/40">No FAQs yet</p>}
+          </div>
+        </div>
+      </div>
+
+      {metrics?.top_categories?.length ? (
+        <div className="card p-5 mt-6">
+          <h2 className="font-semibold text-white mb-4 text-sm">Top categories (30 days)</h2>
+          <div className="flex flex-wrap gap-3">
+            {metrics.top_categories.map((c, i) => (
+              <div key={i} className="flex items-center gap-2 bg-white/10 rounded-lg px-3 py-2">
+                <span className="text-sm font-medium text-white">{c.name}</span>
+                <span className="text-xs text-white/50">{c.question_count} questions</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

@@ -1,0 +1,2 @@
+# PDF/DOCX files are stored here on the server only (not in git).
+# After deploy, upload documents via Admin → Documents.

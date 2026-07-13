@@ -1,36 +1,49 @@
 'use client';
 import { useState, useEffect, useRef } from 'react';
-import { api, Document, Category } from '@/lib/api';
-import { useAuth } from '@/lib/auth';
-import { useRouter } from 'next/navigation';
-import Link from 'next/link';
-import { Upload, Trash2, RefreshCw, FileText, ChevronLeft, Search, Filter } from 'lucide-react';
+import { api, Document, Category, IndexingHealth } from '@/lib/api';
+import { Upload, Trash2, RefreshCw, FileText, Search, Edit2, X, Check, AlertTriangle } from 'lucide-react';
+
+type EditForm = { title: string; original_filename: string; category_id: string };
+
+const INDEXING_LABELS: Record<IndexingHealth, { label: string; className: string }> = {
+  good: { label: 'Fully indexed', className: 'text-green-400' },
+  low: { label: 'Partially indexed', className: 'text-amber-400' },
+  none: { label: 'Not indexed', className: 'text-red-400' },
+  not_ready: { label: '—', className: 'text-gray-500' },
+};
 
 export default function AdminDocuments() {
-  const { user, loading } = useAuth();
-  const router = useRouter();
-  const [docs, setDocs]         = useState<Document[]>([]);
-  const [cats, setCats]         = useState<Category[]>([]);
-  const [total, setTotal]       = useState(0);
-  const [page, setPage]         = useState(1);
-  const [search, setSearch]     = useState('');
+  const [docs, setDocs] = useState<Document[]>([]);
+  const [cats, setCats] = useState<Category[]>([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(1);
+  const [search, setSearch] = useState('');
   const [catFilter, setCatFilter] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
   const [uploading, setUploading] = useState(false);
   const [uploadForm, setUploadForm] = useState<{ title: string; category_id: string }>({ title: '', category_id: '' });
   const [showUpload, setShowUpload] = useState(false);
+  const [reparsingId, setReparsingId] = useState<number | null>(null);
+  const [editingDoc, setEditingDoc] = useState<Document | null>(null);
+  const [editForm, setEditForm] = useState<EditForm>({ title: '', original_filename: '', category_id: '' });
+  const [savingEdit, setSavingEdit] = useState(false);
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [indexingById, setIndexingById] = useState<Record<number, { chunk_count: number; indexing: IndexingHealth }>>({});
+  const [healthWarning, setHealthWarning] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const reparseFileRef = useRef<HTMLInputElement>(null);
+  const reparseTargetRef = useRef<number | null>(null);
 
   useEffect(() => {
-    if (!loading && (!user || user.role !== 'admin')) router.push('/login');
-  }, [user, loading, router]);
+    load();
+    api.admin.categories.list().then((r) => setCats(r.data));
+  }, [page, catFilter, statusFilter]);
 
   useEffect(() => {
-    if (user?.role === 'admin') {
-      load();
-      api.admin.categories.list().then(r => setCats(r.data));
-    }
-  }, [user, page, catFilter, statusFilter]);
+    if (!successMessage) return;
+    const timer = setTimeout(() => setSuccessMessage(null), 4000);
+    return () => clearTimeout(timer);
+  }, [successMessage]);
 
   async function load() {
     const params: Record<string, string | number> = { page };
@@ -38,8 +51,54 @@ export default function AdminDocuments() {
     if (catFilter) params.category_id = catFilter;
     if (statusFilter) params.status = statusFilter;
     const r = await api.admin.documents.list(params);
-    setDocs(r.data);
+
+    let merged = r.data;
+    try {
+      const ovRes = await fetch('/api/admin/documents/overrides');
+      if (ovRes.ok) {
+        const ovPayload = await ovRes.json() as {
+          data?: Record<string, { title: string; original_filename?: string; category_id: number; category_name?: string }>;
+        };
+        const overrides = ovPayload.data ?? {};
+        merged = r.data.map((doc) => {
+          const o = overrides[String(doc.id)];
+          if (!o) return doc;
+          return {
+            ...doc,
+            title: o.title,
+            original_filename: o.original_filename ?? doc.original_filename,
+            category_id: o.category_id,
+            category_name: o.category_name ?? doc.category_name,
+          };
+        });
+      }
+    } catch {
+      // ignore override merge errors
+    }
+
+    setDocs(merged);
     setTotal(r.meta.total);
+
+    try {
+      const health = await api.admin.knowledgeHealth();
+      const map: Record<number, { chunk_count: number; indexing: IndexingHealth }> = {};
+      for (const row of health.data.documents) {
+        map[row.id] = { chunk_count: row.chunk_count, indexing: row.indexing };
+      }
+      setIndexingById(map);
+
+      const { summary } = health.data;
+      if (summary.low_indexing > 0 || summary.not_indexed > 0) {
+        setHealthWarning(
+          `${summary.low_indexing + summary.not_indexed} document(s) are only partially indexed. ` +
+          'Use Re-parse on each row so chat can search the full PDF text.'
+        );
+      } else {
+        setHealthWarning(null);
+      }
+    } catch {
+      setHealthWarning(null);
+    }
   }
 
   async function handleUpload(e: React.FormEvent) {
@@ -54,9 +113,15 @@ export default function AdminDocuments() {
 
     setUploading(true);
     try {
-      const res = await api.admin.documents.upload(fd) as { message?: string; data?: { status?: string; error?: string } };
+      const res = await api.admin.documents.upload(fd) as {
+        message?: string;
+        data?: { status?: string; error?: string };
+      };
       if (res.data?.status === 'error') {
-        alert(res.data.error || res.message || 'Parsing failed');
+        alert(res.data.error || res.message || 'Parsing failed. Deploy latest PHP files, then click Re-parse.');
+        setUploading(false);
+        load();
+        return;
       }
       setShowUpload(false);
       setUploadForm({ title: '', category_id: '' });
@@ -69,33 +134,183 @@ export default function AdminDocuments() {
     }
   }
 
+  function openEdit(doc: Document) {
+    const categoryId =
+      doc.category_id != null
+        ? String(doc.category_id)
+        : String(cats.find(c => c.name === doc.category_name)?.id ?? '');
+
+    setEditingDoc(doc);
+    setEditForm({
+      title: doc.title,
+      original_filename: doc.original_filename,
+      category_id: categoryId,
+    });
+  }
+
+  function closeEdit() {
+    setEditingDoc(null);
+    setEditForm({ title: '', original_filename: '', category_id: '' });
+  }
+
+  async function handleSaveEdit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!editingDoc || !editForm.title.trim() || !editForm.category_id) return;
+
+    setSavingEdit(true);
+    try {
+      await api.admin.documents.update(editingDoc.id, {
+        title: editForm.title.trim(),
+        category_id: Number(editForm.category_id),
+        original_filename: editForm.original_filename.trim() || undefined,
+        category_name: cats.find((c) => String(c.id) === editForm.category_id)?.name,
+      });
+
+      closeEdit();
+      load();
+      setSuccessMessage('Document updated successfully.');
+    } catch (err: unknown) {
+      alert(err instanceof Error ? err.message : 'Failed to update document');
+    } finally {
+      setSavingEdit(false);
+    }
+  }
+
   async function handleDelete(id: number) {
     if (!confirm('Delete this document and all its chunks?')) return;
     await api.admin.documents.delete(id);
     load();
   }
 
-  async function handleReparse(id: number) {
-    await api.admin.documents.reparse(id);
-    load();
+  async function handleReparse(id: number, status?: string) {
+    setReparsingId(id);
+    try {
+      let formData: FormData | undefined;
+
+      if (status === 'error') {
+        reparseTargetRef.current = id;
+        const picked = await new Promise<File | null>((resolve) => {
+          const input = reparseFileRef.current;
+          if (!input) {
+            resolve(null);
+            return;
+          }
+          input.onchange = () => resolve(input.files?.[0] ?? null);
+          input.value = '';
+          input.click();
+        });
+
+        if (picked) {
+          formData = new FormData();
+          formData.append('file', picked);
+        }
+      }
+
+      const res = await api.admin.documents.reparse(id, formData);
+      if (res.data?.status === 'error') {
+        alert(res.data.error || res.message || 'Re-parse failed');
+      }
+      load();
+    } catch (err: unknown) {
+      alert(err instanceof Error ? err.message : 'Re-parse failed');
+    } finally {
+      setReparsingId(null);
+      reparseTargetRef.current = null;
+    }
   }
 
   return (
-    <div className="min-h-screen bg-brand">
-      <div className="max-w-6xl mx-auto px-6 py-6">
-        <div className="flex items-center gap-3 mb-6">
-          <Link href="/admin" className="text-gray-400 hover:text-gray-600"><ChevronLeft className="w-5 h-5" /></Link>
-          <h1 className="text-xl font-bold text-gray-900">Documents</h1>
+    <div className="max-w-6xl mx-auto px-6 py-6">
+      {successMessage && (
+        <div className="mb-4 rounded-lg border border-green-500/30 bg-green-500/10 px-4 py-3 text-sm text-green-300">
+          {successMessage}
+        </div>
+      )}
+      <div className="flex items-center gap-3 mb-6">
+        <h1 className="text-xl font-bold text-white">Documents</h1>
           <span className="text-gray-400 text-sm ml-1">{total} total</span>
           <button onClick={() => setShowUpload(!showUpload)} className="btn-primary ml-auto flex items-center gap-2 text-sm">
             <Upload className="w-4 h-4" />Upload document
           </button>
         </div>
 
+        {healthWarning && (
+          <div className="mb-4 flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
+            <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+            <p>{healthWarning}</p>
+          </div>
+        )}
+
+        {/* Edit modal */}
+        {editingDoc && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
+            <div className="card w-full max-w-md p-5">
+              <div className="flex items-center justify-between mb-4">
+                <h2 className="font-semibold text-white text-sm">Edit document</h2>
+                <button onClick={closeEdit} className="p-1 text-white/50 hover:text-white rounded">
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+              <form onSubmit={handleSaveEdit} className="space-y-4">
+                <div>
+                  <label className="text-xs text-white/50 mb-1 block">Document name *</label>
+                  <input
+                    className="input"
+                    required
+                    value={editForm.title}
+                    onChange={e => setEditForm(p => ({ ...p, title: e.target.value }))}
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-white/50 mb-1 block">File name</label>
+                  <input
+                    className="input"
+                    placeholder="e.g. Manual.pdf"
+                    value={editForm.original_filename}
+                    onChange={e => setEditForm(p => ({ ...p, original_filename: e.target.value }))}
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-white/50 mb-1 block">Category *</label>
+                  <select
+                    className="input"
+                    required
+                    value={editForm.category_id}
+                    onChange={e => setEditForm(p => ({ ...p, category_id: e.target.value }))}
+                  >
+                    <option value="">Select category</option>
+                    {cats.map(c => (
+                      <option key={c.id} value={c.id}>{c.name}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="flex gap-2 pt-1">
+                  <button type="submit" className="btn-primary text-sm flex items-center gap-1" disabled={savingEdit}>
+                    <Check className="w-4 h-4" />
+                    {savingEdit ? 'Saving…' : 'Save changes'}
+                  </button>
+                  <button type="button" className="btn-secondary text-sm" onClick={closeEdit}>
+                    Cancel
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+
+        {/* Hidden file input for re-parse with local PDF */}
+        <input
+          ref={reparseFileRef}
+          type="file"
+          accept=".pdf,.docx"
+          className="hidden"
+          aria-hidden
+        />
+
         {/* Upload form */}
         {showUpload && (
           <div className="card p-5 mb-6">
-            <h2 className="font-semibold text-gray-800 mb-4 text-sm">Upload new document</h2>
+            <h2 className="font-semibold text-gray-200 mb-4 text-sm">Upload new document</h2>
             <form onSubmit={handleUpload} className="grid grid-cols-1 md:grid-cols-3 gap-4">
               <div>
                 <label className="text-xs text-gray-500 mb-1 block">Title (optional)</label>
@@ -152,7 +367,7 @@ export default function AdminDocuments() {
               <tr>
                 <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Document</th>
                 <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Category</th>
-                <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Pages</th>
+                <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Indexed</th>
                 <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Status</th>
                 <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Uploaded</th>
                 <th className="px-4 py-3" />
@@ -160,18 +375,33 @@ export default function AdminDocuments() {
             </thead>
             <tbody className="divide-y divide-gray-100">
               {docs.map(doc => (
-                <tr key={doc.id} className="hover:bg-gray-50">
+                <tr key={doc.id} className="hover:bg-white/10 hover:shadow-sm">
                   <td className="px-4 py-3">
                     <div className="flex items-center gap-2">
                       <FileText className="w-4 h-4 text-gray-400 flex-shrink-0" />
                       <div>
-                        <p className="font-medium text-gray-900">{doc.title}</p>
+                        <p className="font-medium text-gray-100">{doc.title}</p>
                         <p className="text-xs text-gray-400">{doc.original_filename}</p>
                       </div>
                     </div>
                   </td>
-                  <td className="px-4 py-3 text-gray-600">{doc.category_name}</td>
-                  <td className="px-4 py-3 text-gray-600">{doc.page_count ?? '—'}</td>
+                  <td className="px-4 py-3 text-gray-100">{doc.category_name}</td>
+                  <td className="px-4 py-3 text-xs">
+                    {(() => {
+                      const info = indexingById[doc.id];
+                      const chunks = info?.chunk_count ?? doc.chunk_count;
+                      const indexing = info?.indexing ?? (doc.status === 'ready' ? 'good' : 'not_ready');
+                      const meta = INDEXING_LABELS[indexing];
+                      return (
+                        <div>
+                          <p className="font-medium text-gray-100 tabular-nums">
+                            {chunks != null ? `${chunks} chunks` : '—'}
+                          </p>
+                          <p className={meta.className}>{meta.label}</p>
+                        </div>
+                      );
+                    })()}
+                  </td>
                   <td className="px-4 py-3">
                     <span className={`badge-${doc.status}`}>{doc.status}</span>
                     {doc.status === 'error' && doc.error_message && (
@@ -184,13 +414,25 @@ export default function AdminDocuments() {
                       <p className="text-xs text-red-500 mt-1 font-medium">File missing on server — re-upload PDF</p>
                     )}
                   </td>
-                  <td className="px-4 py-3 text-gray-400 text-xs">{new Date(doc.created_at).toLocaleDateString()}</td>
+                  <td className="px-4 py-3 text-gray-100 text-xs">{new Date(doc.created_at).toLocaleDateString()}</td>
                   <td className="px-4 py-3">
                     <div className="flex items-center gap-1">
-                      <button onClick={() => handleReparse(doc.id)} title="Re-parse" className="p-1.5 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded">
-                        <RefreshCw className="w-3.5 h-3.5" />
+                      <button
+                        onClick={() => openEdit(doc)}
+                        title="Edit"
+                        className="p-1.5 text-gray-100 hover:text-blue-400 hover:bg-blue-500/10 rounded"
+                      >
+                        <Edit2 className="w-3.5 h-3.5" />
                       </button>
-                      <button onClick={() => handleDelete(doc.id)} title="Delete" className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded">
+                      <button
+                        onClick={() => handleReparse(doc.id, doc.status)}
+                        title={doc.status === 'error' ? 'Re-parse (pick PDF file)' : 'Re-parse'}
+                        disabled={reparsingId === doc.id}
+                        className="p-1.5 text-gray-100 hover:text-blue-600 hover:bg-blue-50 rounded disabled:opacity-50"
+                      >
+                        <RefreshCw className={`w-3.5 h-3.5 ${reparsingId === doc.id ? 'animate-spin' : ''}`} />
+                      </button>
+                      <button onClick={() => handleDelete(doc.id)} title="Delete" className="p-1.5 text-gray-100 hover:text-red-600 hover:bg-red-50 rounded">
                         <Trash2 className="w-3.5 h-3.5" />
                       </button>
                     </div>
@@ -198,7 +440,7 @@ export default function AdminDocuments() {
                 </tr>
               ))}
               {!docs.length && (
-                <tr><td colSpan={6} className="text-center py-12 text-gray-400 text-sm">No documents found</td></tr>
+                <tr><td colSpan={5} className="text-center py-12 text-gray-400 text-sm">No documents found</td></tr>
               )}
             </tbody>
           </table>
@@ -214,7 +456,6 @@ export default function AdminDocuments() {
             </div>
           </div>
         )}
-      </div>
     </div>
   );
 }

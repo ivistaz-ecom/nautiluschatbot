@@ -34,3 +34,13 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Local API working copy is tracked so deployable PHP fixes are not lost.
+# Ignore only runtime artifacts under nautilusapi.
+/nautilusapi/logs/
+/nautilusapi/uploads/*
+!/nautilusapi/uploads/.gitkeep
+/nautilusapi/config/secrets.php
+# Local document title/category overrides (dev fallback)
+/data/document-overrides.json
+
