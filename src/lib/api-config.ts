@@ -1,9 +1,6 @@
 /** Client-facing API base URL (browser requests). */
 export const API_URL =
-  process.env.NEXT_PUBLIC_API_URL ||
-  (process.env.NODE_ENV === 'development'
-    ? '/api/proxy/v1'
-    : 'https://nautilus.crafttechhub.com/api/v1');
+  process.env.NEXT_PUBLIC_API_URL || '/api/proxy/v1';
 
 /** Upstream PHP API used by server-side routes and the dev proxy. */
 export const API_BACKEND_URL =
