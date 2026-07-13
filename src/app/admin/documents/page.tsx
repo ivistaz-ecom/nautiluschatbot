@@ -1,16 +1,28 @@
 'use client';
 import { useState, useEffect, useRef } from 'react';
-import { api, Document, Category, IndexingHealth } from '@/lib/api';
-import { Upload, Trash2, RefreshCw, FileText, Search, Edit2, X, Check, AlertTriangle } from 'lucide-react';
+import { api, Document, Category } from '@/lib/api';
+import { Upload, Trash2, RefreshCw, FileText, Search, Edit2, X, Check } from 'lucide-react';
 
 type EditForm = { title: string; original_filename: string; category_id: string };
 
-const INDEXING_LABELS: Record<IndexingHealth, { label: string; className: string }> = {
-  good: { label: 'Fully indexed', className: 'text-green-400' },
-  low: { label: 'Partially indexed', className: 'text-amber-400' },
-  none: { label: 'Not indexed', className: 'text-red-400' },
-  not_ready: { label: '—', className: 'text-gray-500' },
-};
+function formatStatusLabel(status: Document['status']): string {
+  return status.charAt(0).toUpperCase() + status.slice(1);
+}
+
+function statusBadgeClass(status: Document['status']): string {
+  switch (status) {
+    case 'ready':
+      return 'inline-flex items-center rounded-full border border-green-500/50 bg-green-500/20 px-2 py-0.5 text-xs font-semibold text-green-400';
+    case 'pending':
+      return 'inline-flex items-center rounded-full bg-yellow-500/20 px-2 py-0.5 text-xs font-medium text-yellow-300';
+    case 'processing':
+      return 'inline-flex items-center rounded-full bg-blue-500/20 px-2 py-0.5 text-xs font-medium text-blue-300';
+    case 'error':
+      return 'inline-flex items-center rounded-full bg-red-500/20 px-2 py-0.5 text-xs font-medium text-red-300';
+    default:
+      return 'inline-flex items-center rounded-full bg-white/10 px-2 py-0.5 text-xs font-medium text-white/70';
+  }
+}
 
 export default function AdminDocuments() {
   const [docs, setDocs] = useState<Document[]>([]);
@@ -28,8 +40,6 @@ export default function AdminDocuments() {
   const [editForm, setEditForm] = useState<EditForm>({ title: '', original_filename: '', category_id: '' });
   const [savingEdit, setSavingEdit] = useState(false);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
-  const [indexingById, setIndexingById] = useState<Record<number, { chunk_count: number; indexing: IndexingHealth }>>({});
-  const [healthWarning, setHealthWarning] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const reparseFileRef = useRef<HTMLInputElement>(null);
   const reparseTargetRef = useRef<number | null>(null);
@@ -78,27 +88,6 @@ export default function AdminDocuments() {
 
     setDocs(merged);
     setTotal(r.meta.total);
-
-    try {
-      const health = await api.admin.knowledgeHealth();
-      const map: Record<number, { chunk_count: number; indexing: IndexingHealth }> = {};
-      for (const row of health.data.documents) {
-        map[row.id] = { chunk_count: row.chunk_count, indexing: row.indexing };
-      }
-      setIndexingById(map);
-
-      const { summary } = health.data;
-      if (summary.low_indexing > 0 || summary.not_indexed > 0) {
-        setHealthWarning(
-          `${summary.low_indexing + summary.not_indexed} document(s) are only partially indexed. ` +
-          'Use Re-parse on each row so chat can search the full PDF text.'
-        );
-      } else {
-        setHealthWarning(null);
-      }
-    } catch {
-      setHealthWarning(null);
-    }
   }
 
   async function handleUpload(e: React.FormEvent) {
@@ -234,13 +223,6 @@ export default function AdminDocuments() {
           </button>
         </div>
 
-        {healthWarning && (
-          <div className="mb-4 flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
-            <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
-            <p>{healthWarning}</p>
-          </div>
-        )}
-
         {/* Edit modal */}
         {editingDoc && (
           <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
@@ -367,7 +349,6 @@ export default function AdminDocuments() {
               <tr>
                 <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Document</th>
                 <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Category</th>
-                <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Indexed</th>
                 <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Status</th>
                 <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Uploaded</th>
                 <th className="px-4 py-3" />
@@ -386,24 +367,8 @@ export default function AdminDocuments() {
                     </div>
                   </td>
                   <td className="px-4 py-3 text-gray-100">{doc.category_name}</td>
-                  <td className="px-4 py-3 text-xs">
-                    {(() => {
-                      const info = indexingById[doc.id];
-                      const chunks = info?.chunk_count ?? doc.chunk_count;
-                      const indexing = info?.indexing ?? (doc.status === 'ready' ? 'good' : 'not_ready');
-                      const meta = INDEXING_LABELS[indexing];
-                      return (
-                        <div>
-                          <p className="font-medium text-gray-100 tabular-nums">
-                            {chunks != null ? `${chunks} chunks` : '—'}
-                          </p>
-                          <p className={meta.className}>{meta.label}</p>
-                        </div>
-                      );
-                    })()}
-                  </td>
                   <td className="px-4 py-3">
-                    <span className={`badge-${doc.status}`}>{doc.status}</span>
+                    <span className={statusBadgeClass(doc.status)}>{formatStatusLabel(doc.status)}</span>
                     {doc.status === 'error' && doc.error_message && (
                       <p className="text-xs text-red-400 mt-1 max-w-xs">{doc.error_message}</p>
                     )}

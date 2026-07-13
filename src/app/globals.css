@@ -31,7 +31,7 @@
   .card {
     @apply bg-brand-light rounded-xl border border-white/10 shadow-lg;
   }
-  .badge-ready    { @apply bg-green-500/20 text-green-300 text-xs px-2 py-0.5 rounded-full font-medium; }
+  .badge-ready    { @apply bg-green-500/20 border border-green-500/50 text-xs px-2 py-0.5 rounded-full font-semibold !text-green-300; }
   .badge-pending  { @apply bg-yellow-500/20 text-yellow-300 text-xs px-2 py-0.5 rounded-full font-medium; }
   .badge-error    { @apply bg-red-500/20 text-red-300 text-xs px-2 py-0.5 rounded-full font-medium; }
   .badge-processing { @apply bg-blue-500/20 text-blue-300 text-xs px-2 py-0.5 rounded-full font-medium; }
