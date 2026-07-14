@@ -28,16 +28,18 @@ export async function synthesizeAnswerFromPassages(
 
 Return STRICT JSON only:
 {
-  "answer": "1-2 complete sentences that directly answer the question",
+  "answer": "1-3 complete sentences that directly answer the question",
   "usedSources": [0]
 }
 
 Rules:
-- Write a natural, conversational reply — as if explaining to a colleague.
+- Write a natural, conversational reply — as if explaining to a colleague (like ChatGPT).
+- Prefer excerpts that contain the SAME topic phrase as the question (e.g. "superintendent inspections"), not merely related words like "inspection".
+- If multiple sources agree, synthesize one clear answer. If they conflict, prefer the more specific topic match and briefly note any difference.
 - Answer ONLY from the excerpts. Be specific (include frequencies, timeframes, requirements when present).
 - Do NOT copy bullet lists, section headings, document headers, or page labels.
 - Do NOT start with "According to" or cite source numbers in the answer text.
-- Keep the answer under 60 words when possible.
+- Keep the answer under 80 words when possible.
 - If the excerpts do not contain the answer, return:
 {"answer": "I could not find this information in the available documents.", "usedSources": []}
 

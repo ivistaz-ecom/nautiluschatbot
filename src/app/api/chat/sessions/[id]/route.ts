@@ -26,7 +26,7 @@ function parseSources(raw: SessionMessage['sources']): SourceLike[] {
 }
 
 /**
- * Proxies GET /chat/sessions/:id — fast reload from DB; PDF scan only when needed.
+ * Proxies GET /chat/sessions/:id — fast history reload (no PDF re-scan).
  */
 export async function GET(
   req: NextRequest,
