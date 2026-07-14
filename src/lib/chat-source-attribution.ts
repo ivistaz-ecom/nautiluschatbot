@@ -316,17 +316,25 @@ export async function locateSourcesForQuestion(
 ): Promise<SourceLike[]> {
   if (!auth || !question.trim()) return [];
 
-  const hit = await findBestAnswerHit(auth, question, documentId);
-  if (!hit) return [];
+  const hits = await findTopAnswerHits(auth, question, documentId);
+  if (hits.length === 0) return [];
 
   // Heading-style queries: only cite when we found the real section page.
-  if (isHeadingStyleQuestion(question) && hit.headingScore < 0.65) {
-    return [];
+  if (isHeadingStyleQuestion(question)) {
+    const headingHits = hits.filter((h) => h.headingScore >= 0.65);
+    if (headingHits.length === 0) return [];
+    return headingHits.map((h, index) => ({
+      ...sourceFromHit(h),
+      relevance_rank: index + 1,
+    }));
   }
 
-  if (hit.score < 0.25) return [];
-
-  return [sourceFromHit(hit)];
+  return hits
+    .filter((h) => h.score >= MIN_HIT_SCORE)
+    .map((h, index) => ({
+      ...sourceFromHit(h),
+      relevance_rank: index + 1,
+    }));
 }
 
 async function finalizeVerifiedSources(
@@ -352,7 +360,7 @@ async function finalizeVerifiedSources(
 
 /**
  * Fast path for reloading saved chats — uses DB + cached sources only.
- * Skips PDF re-scan unless the message was unanswered or missing sources.
+ * Never re-scans PDFs when opening history (that made old chats take 20s+).
  */
 export async function resolveSessionMessage(
   auth: string,
@@ -364,23 +372,19 @@ export async function resolveSessionMessage(
   const answered = isAnswered && Boolean(answer) && !isNotFoundAnswer(answer);
   const sources = Array.isArray(rawSources) ? dedupeSources(rawSources) : [];
 
-  if (answered && sources.length > 0 && auth) {
+  if (!answered) {
     return {
       answer,
-      is_answered: true,
-      sources: finalizeSourceLinks(auth, sources),
+      is_answered: false,
+      sources: auth && sources.length ? finalizeSourceLinks(auth, sources) : [],
     };
   }
 
-  if (answered && sources.length === 0) {
-    return resolveAssistantTurn(auth, question, answer, true, []);
-  }
-
-  if (!answered) {
-    return resolveAssistantTurn(auth, question, answer, false, sources);
-  }
-
-  return { answer, is_answered: true, sources: auth ? finalizeSourceLinks(auth, sources) : sources };
+  return {
+    answer,
+    is_answered: true,
+    sources: auth && sources.length ? finalizeSourceLinks(auth, sources) : [],
+  };
 }
 
 /**
@@ -398,19 +402,36 @@ export async function resolveAssistantTurn(
     return { answer, is_answered: isAnswered, sources: [] };
   }
 
-  const hit = await findBestAnswerHit(auth, question);
+  const hits = await findTopAnswerHits(auth, question);
+  const hit = hits[0] ?? null;
   const needsBetterAnswer =
     !isAnswered || isNotFoundAnswer(answer) || looksLikeRawDump(answer);
+
+  // Even when the API returns an answer, prefer a strong PDF topic match
+  // (e.g. "superintendent inspections") over a weak keyword hit
+  // (e.g. "annual inspection").
+  const strongPdfHit =
+    Boolean(hit) &&
+    (phraseMatchScore(hit!.sentence + ' ' + hit!.pageText, question) >= 0.65 ||
+      hit!.score >= 0.85);
+
+  const apiTopicWeak =
+    Boolean(answer) &&
+    !isNotFoundAnswer(answer) &&
+    phraseMatchScore(answer, question) < 0.5 &&
+    topicCoverage(answer, question) < 0.6;
 
   let finalAnswer = answer;
   let finalAnswered = isAnswered && !isNotFoundAnswer(answer);
 
-  if (needsBetterAnswer && hit) {
-    const llmPassages = [
-      { fileName: hit.fileName, page: hit.physicalPage, text: hit.pageText },
-    ];
+  if ((needsBetterAnswer || (strongPdfHit && apiTopicWeak)) && hits.length > 0) {
+    const llmPassages = hits.slice(0, 3).map((h) => ({
+      fileName: h.fileName,
+      page: h.physicalPage,
+      text: h.pageText,
+    }));
     const synthesized = await synthesizeAnswerFromPassages(question, llmPassages);
-    const extracted = buildConciseAnswer(hit.sentence);
+    const extracted = buildConciseAnswer(hit!.sentence);
     const candidate = synthesized || extracted;
 
     if (candidate && candidate.length >= 15 && !isNotFoundAnswer(candidate)) {
@@ -420,7 +441,7 @@ export async function resolveAssistantTurn(
   }
 
   // PDF hit with no API answer — still answer from the matched passage.
-  if (!finalAnswered && hit && hit.score >= 0.25) {
+  if (!finalAnswered && hit && hit.score >= MIN_HIT_SCORE) {
     const extracted = buildConciseAnswer(hit.sentence);
     if (extracted && extracted.length >= 15) {
       finalAnswer = extracted;
@@ -434,8 +455,21 @@ export async function resolveAssistantTurn(
 
   let sources: SourceLike[] = [];
 
-  if (hit && hit.score >= 0.25 && (!isHeadingStyleQuestion(question) || hit.headingScore >= 0.65)) {
-    sources = finalizeSourceLinks(auth, [sourceFromHit(hit)]);
+  if (hits.length > 0) {
+    const grounded = hits.filter(
+      (h) =>
+        h.score >= MIN_HIT_SCORE &&
+        (!isHeadingStyleQuestion(question) || h.headingScore >= 0.65)
+    );
+    if (grounded.length > 0) {
+      sources = finalizeSourceLinks(
+        auth,
+        grounded.map((h, index) => ({
+          ...sourceFromHit(h),
+          relevance_rank: index + 1,
+        }))
+      );
+    }
   }
 
   if (!sources.length) {
@@ -496,22 +530,117 @@ async function loadPdfPages(fileId: number, auth: string): Promise<string[] | nu
   }
 }
 
-function significantTokens(text: string): string[] {
-  const stop = new Set([
-    'the', 'and', 'for', 'that', 'with', 'this', 'from', 'are', 'was', 'were',
-    'have', 'has', 'had', 'will', 'shall', 'must', 'can', 'may', 'also', 'into',
-    'based', 'provided', 'sources', 'following', 'involves', 'process',
-  ]);
+/** Question filler words that should not drive retrieval alone. */
+const QUESTION_STOP = new Set([
+  'the', 'and', 'for', 'that', 'with', 'this', 'from', 'are', 'was', 'were',
+  'have', 'has', 'had', 'will', 'shall', 'must', 'can', 'may', 'also', 'into',
+  'based', 'provided', 'sources', 'following', 'involves', 'process',
+  'what', 'when', 'where', 'which', 'who', 'whom', 'whose', 'why', 'how',
+  'does', 'do', 'did', 'is', 'it', 'its', 'them', 'they', 'their', 'there',
+  'about', 'happen', 'happens', 'happening', 'occur', 'occurs', 'much', 'many',
+  'often', 'please', 'tell', 'give', 'need', 'know', 'find', 'show', 'explain',
+]);
 
+/** Normalize plurals / light stemming so inspection ≈ inspections. */
+function normalizeToken(token: string): string {
+  const t = token.toLowerCase();
+  if (t.length <= 4) return t;
+  if (t.endsWith('ies') && t.length > 5) return `${t.slice(0, -3)}y`;
+  if (t.endsWith('sses')) return t.slice(0, -2);
+  if (t.endsWith('s') && !t.endsWith('ss') && !t.endsWith('us') && !t.endsWith('is')) {
+    return t.slice(0, -1);
+  }
+  return t;
+}
+
+function significantTokens(text: string): string[] {
   return Array.from(
     new Set(
       text
         .toLowerCase()
         .replace(/[^a-z0-9\s]/g, ' ')
         .split(/\s+/)
-        .filter((w) => w.length >= 4 && !stop.has(w))
+        .filter((w) => w.length >= 4 && !QUESTION_STOP.has(w))
+        .map(normalizeToken)
     )
   );
+}
+
+/** Core topic tokens excluding pure frequency/time words. */
+function topicTokens(question: string): string[] {
+  const frequencyish = new Set([
+    'often', 'frequency', 'interval', 'period', 'annual', 'yearly', 'monthly',
+    'weekly', 'daily', 'quarterly', 'times', 'year', 'years', 'month', 'months',
+  ]);
+  return significantTokens(question).filter((t) => !frequencyish.has(t));
+}
+
+/**
+ * Multi-word topic phrases from the question
+ * e.g. "superintendent inspections" from
+ * "How often do superintendent inspections happen?"
+ */
+function extractTopicPhrases(question: string): string[] {
+  const words = question
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length >= 3 && !QUESTION_STOP.has(w) && !/^\d+$/.test(w));
+
+  const phrases: string[] = [];
+  for (let i = 0; i < words.length - 1; i++) {
+    phrases.push(`${words[i]} ${words[i + 1]}`);
+  }
+  for (let i = 0; i < words.length - 2; i++) {
+    phrases.push(`${words[i]} ${words[i + 1]} ${words[i + 2]}`);
+  }
+  return Array.from(new Set(phrases));
+}
+
+function textHasNormalizedToken(haystack: string, token: string): boolean {
+  const lower = haystack.toLowerCase();
+  if (lower.includes(token)) return true;
+  const hayTokens = new Set(significantTokens(haystack));
+  return hayTokens.has(normalizeToken(token));
+}
+
+function phraseMatchScore(text: string, question: string): number {
+  const lower = text.toLowerCase();
+  const phrases = extractTopicPhrases(question);
+  if (phrases.length === 0) return 0;
+
+  let best = 0;
+  for (const phrase of phrases) {
+    if (lower.includes(phrase)) {
+      best = Math.max(best, phrase.split(' ').length >= 3 ? 1 : 0.85);
+      continue;
+    }
+    // Plural/stem tolerant: "superintendent inspection" ≈ "superintendent inspections"
+    const parts = phrase.split(' ').map(normalizeToken);
+    if (parts.every((p) => textHasNormalizedToken(lower, p))) {
+      // consecutive-ish presence of both topic words
+      const idxs = parts.map((p) => {
+        const re = new RegExp(`\\b${p}s?\\b`, 'i');
+        const m = lower.match(re);
+        return m?.index ?? -1;
+      });
+      if (idxs.every((i) => i >= 0)) {
+        const span = Math.max(...idxs) - Math.min(...idxs);
+        if (span <= 40) best = Math.max(best, 0.7);
+      }
+    }
+  }
+  return best;
+}
+
+function topicCoverage(text: string, question: string): number {
+  const topics = topicTokens(question);
+  if (topics.length === 0) return 1;
+  let hits = 0;
+  for (const token of topics) {
+    if (textHasNormalizedToken(text, token)) hits++;
+  }
+  return hits / topics.length;
 }
 
 function scorePageAgainstAnswer(pageText: string, answerTokens: string[], answer: string, question: string): number {
@@ -520,7 +649,7 @@ function scorePageAgainstAnswer(pageText: string, answerTokens: string[], answer
 
   let hits = 0;
   for (const token of answerTokens) {
-    if (pageTokens.has(token) || pageLower.includes(token)) hits++;
+    if (pageTokens.has(normalizeToken(token)) || pageLower.includes(token)) hits++;
   }
   const tokenScore = answerTokens.length > 0 ? hits / answerTokens.length : 0;
 
@@ -540,8 +669,18 @@ function scorePageAgainstAnswer(pageText: string, answerTokens: string[], answer
     if (pageLower.includes(phrase)) phraseHits++;
   }
   const phraseScore = phraseTotal > 0 ? phraseHits / phraseTotal : 0;
+  const topicPhrase = phraseMatchScore(pageText, question);
+  const coverage = topicCoverage(pageText, question);
 
-  return tokenScore * 0.35 + questionScore * 0.45 + phraseScore * 0.2;
+  // Topic phrase + coverage dominate so "superintendent inspections" beats
+  // unrelated "annual inspection" pages that only share the word inspection.
+  return (
+    tokenScore * 0.15 +
+    questionScore * 0.2 +
+    phraseScore * 0.1 +
+    topicPhrase * 0.35 +
+    coverage * 0.2
+  );
 }
 
 type ReadyPdfDoc = {
@@ -632,14 +771,27 @@ function scoreSentence(sentence: string, question: string): number {
 
   const lower = cleaned.toLowerCase();
   const qLower = question.toLowerCase();
+  const phraseBoost = phraseMatchScore(cleaned, question);
+  const coverage = topicCoverage(cleaned, question);
 
-  if (/superintendent/i.test(lower) && /inspection/i.test(lower)) score += 0.25;
-  if (/oil record book|orb/i.test(lower) && /record|entries|oil/i.test(qLower)) score += 0.4;
-  if (/at least once|once in a year|12 months|every year|per year/i.test(lower)) score += 0.45;
-  if (/4\.?\s*1\s+superintendent/i.test(lower)) score += 0.35;
+  // Strong boost for exact topic phrase match — this is the key signal.
+  score += phraseBoost * 0.55;
 
-  if (/\b(how often|frequency)\b/i.test(qLower)) {
-    if (/\b(months?|years?|annual|quarterly|weekly|daily|times)\b/i.test(lower)) score += 0.35;
+  // Frequency / schedule cues only count when the topic is also present.
+  // Otherwise "ANNUAL INSPECTION" wins for "superintendent inspections" questions.
+  const topicPresent = coverage >= 0.5 || phraseBoost >= 0.65;
+  if (topicPresent) {
+    if (/at least once|once in a year|12 months|every year|per year|once a year/i.test(lower)) {
+      score += 0.35;
+    }
+    if (/\b(how often|frequency)\b/i.test(qLower)) {
+      if (/\b(months?|years?|annual|quarterly|weekly|daily|times)\b/i.test(lower)) {
+        score += 0.25;
+      }
+    }
+  } else if (tokens.length >= 2 && coverage < 0.4) {
+    // Hard penalty for answers that miss most of the topic words.
+    score *= 0.25;
   }
 
   return score;
@@ -686,34 +838,63 @@ type AnswerHit = {
   headingScore: number;
 };
 
-/** Find the single best answer sentence and the exact PDF page it lives on. */
-async function findBestAnswerHit(
+const MAX_ANSWER_HITS = 5;
+const MIN_HIT_SCORE = 0.35;
+
+function considerHit(hits: AnswerHit[], candidate: AnswerHit): void {
+  if (candidate.score < MIN_HIT_SCORE) return;
+
+  // Prefer the best page within the same document.
+  const existingIdx = hits.findIndex((h) => h.fileId === candidate.fileId);
+  if (existingIdx >= 0) {
+    if (candidate.score > hits[existingIdx].score) {
+      hits[existingIdx] = candidate;
+    }
+    return;
+  }
+
+  hits.push(candidate);
+  hits.sort((a, b) => b.score - a.score);
+  if (hits.length > MAX_ANSWER_HITS) hits.length = MAX_ANSWER_HITS;
+}
+
+/**
+ * Find the best matching passages across PDFs.
+ * Returns multiple documents when several manuals answer the question.
+ */
+async function findTopAnswerHits(
   auth: string,
   question: string,
   onlyDocumentId?: number
-): Promise<AnswerHit | null> {
+): Promise<AnswerHit[]> {
   const docs = await listReadyPdfDocuments(auth);
-  if (docs.length === 0) return null;
+  if (docs.length === 0) return [];
 
   const tokens = significantTokens(question);
-  if (tokens.length === 0) return null;
+  if (tokens.length === 0) return [];
 
   const headingQuery = isHeadingStyleQuestion(question);
-  let best: AnswerHit | null = null;
+  const hits: AnswerHit[] = [];
+  const phrases = extractTopicPhrases(question);
 
   const rankedDocs = [...docs]
     .filter((doc) => !onlyDocumentId || doc.id === onlyDocumentId)
     .sort((a, b) => {
       const ah = `${a.title} ${a.original_filename || ''}`.toLowerCase();
       const bh = `${b.title} ${b.original_filename || ''}`.toLowerCase();
-      const aHits = tokens.filter((t) => ah.includes(t)).length;
-      const bHits = tokens.filter((t) => bh.includes(t)).length;
+      const aPhrase = phrases.filter((p) => ah.includes(p)).length;
+      const bPhrase = phrases.filter((p) => bh.includes(p)).length;
+      if (bPhrase !== aPhrase) return bPhrase - aPhrase;
+      const aHits = tokens.filter((t) => ah.includes(t) || ah.includes(normalizeToken(t))).length;
+      const bHits = tokens.filter((t) => bh.includes(t) || bh.includes(normalizeToken(t))).length;
       return bHits - aHits;
     });
 
   for (const doc of rankedDocs) {
     const pages = await loadPdfPages(doc.id, auth);
     if (!pages) continue;
+
+    let bestInDoc: AnswerHit | null = null;
 
     pages.forEach((pageText, index) => {
       const physicalPage = index + 1;
@@ -727,28 +908,29 @@ async function findBestAnswerHit(
       if (stripped.length < 40) return;
 
       const headingScore = scoreSectionHeadingMatch(content, question);
+      const pagePhrase = phraseMatchScore(content, question);
+      const pageCoverage = topicCoverage(content, question);
+
+      const makeHit = (sentence: string, score: number): AnswerHit => ({
+        fileId: doc.id,
+        fileName: doc.title,
+        physicalPage,
+        printedPage: extractPrintedPageNumber(content),
+        sentence,
+        pageText: stripped.slice(0, 2200),
+        score,
+        headingScore,
+      });
 
       if (headingQuery) {
         if (headingScore < 0.65) return;
-
         const ranked = splitSentences(content)
           .map((sentence) => ({ sentence, score: scoreSentence(sentence, question) }))
           .sort((a, b) => b.score - a.score);
         const sentence = ranked[0]?.sentence || stripped.slice(0, 280);
-        const score = headingScore + (ranked[0]?.score ?? 0);
-
-        if (!best || score > best.score) {
-          best = {
-            fileId: doc.id,
-            fileName: doc.title,
-            physicalPage,
-            printedPage: extractPrintedPageNumber(content),
-            sentence,
-            pageText: stripped.slice(0, 2200),
-            score,
-            headingScore,
-          };
-        }
+        const score = headingScore + (ranked[0]?.score ?? 0) + pagePhrase * 0.2;
+        const hit = makeHit(sentence, score);
+        if (!bestInDoc || hit.score > bestInDoc.score) bestInDoc = hit;
         return;
       }
 
@@ -757,45 +939,41 @@ async function findBestAnswerHit(
           .map((sentence) => ({ sentence, score: scoreSentence(sentence, question) }))
           .sort((a, b) => b.score - a.score);
         const sentence = ranked[0]?.sentence || stripped.slice(0, 280);
-        const score = headingScore + (ranked[0]?.score ?? 0) + 0.2;
-
-        if (!best || score > best.score) {
-          best = {
-            fileId: doc.id,
-            fileName: doc.title,
-            physicalPage,
-            printedPage: extractPrintedPageNumber(content),
-            sentence,
-            pageText: stripped.slice(0, 2200),
-            score,
-            headingScore,
-          };
-        }
+        const score = headingScore + (ranked[0]?.score ?? 0) + 0.2 + pagePhrase * 0.25;
+        const hit = makeHit(sentence, score);
+        if (!bestInDoc || hit.score > bestInDoc.score) bestInDoc = hit;
       }
 
       for (const sentence of splitSentences(content)) {
-        const score = scoreSentence(sentence, question);
-        if (score < 0.35) continue;
+        let score = scoreSentence(sentence, question);
+        // Page-level topic context helps when the sentence is short but on-topic.
+        if (pagePhrase >= 0.65) score += 0.15;
+        if (pageCoverage >= 0.5) score += 0.08;
+        if (score < MIN_HIT_SCORE) continue;
 
-        if (!best || score > best.score) {
-          best = {
-            fileId: doc.id,
-            fileName: doc.title,
-            physicalPage,
-            printedPage: extractPrintedPageNumber(content),
-            sentence,
-            pageText: stripped.slice(0, 2200),
-            score,
-            headingScore,
-          };
-        }
+        const hit = makeHit(sentence, score);
+        if (!bestInDoc || hit.score > bestInDoc.score) bestInDoc = hit;
       }
     });
 
-    if (best && best.score >= 0.9) break;
+    if (bestInDoc) considerHit(hits, bestInDoc);
   }
 
-  return best;
+  // Keep only hits that stay competitive with the best match.
+  if (hits.length === 0) return [];
+  const topScore = hits[0].score;
+  const relativeFloor = Math.max(MIN_HIT_SCORE, topScore * 0.55);
+  return hits.filter((h) => h.score >= relativeFloor);
+}
+
+/** Find the single best answer sentence and the exact PDF page it lives on. */
+async function findBestAnswerHit(
+  auth: string,
+  question: string,
+  onlyDocumentId?: number
+): Promise<AnswerHit | null> {
+  const hits = await findTopAnswerHits(auth, question, onlyDocumentId);
+  return hits[0] ?? null;
 }
 
 function extractAnswerSentences(pageText: string, question: string): string {
@@ -818,16 +996,15 @@ export async function recoverAnswerFromDocuments(
 ): Promise<{ answer: string; sources: SourceLike[] } | null> {
   if (!auth || !question.trim()) return null;
 
-  const hit = await findBestAnswerHit(auth, question);
-  if (!hit || hit.score < 0.25) return null;
+  const hits = await findTopAnswerHits(auth, question);
+  const hit = hits[0];
+  if (!hit || hit.score < MIN_HIT_SCORE) return null;
 
-  const llmPassages = [
-    {
-      fileName: hit.fileName,
-      page: hit.physicalPage,
-      text: hit.pageText,
-    },
-  ];
+  const llmPassages = hits.slice(0, 3).map((h) => ({
+    fileName: h.fileName,
+    page: h.physicalPage,
+    text: h.pageText,
+  }));
 
   let answer =
     (await synthesizeAnswerFromPassages(question, llmPassages)) ||
@@ -835,5 +1012,11 @@ export async function recoverAnswerFromDocuments(
 
   if (!answer || answer.length < 20 || /could not find/i.test(answer)) return null;
 
-  return { answer, sources: [sourceFromHit(hit)] };
+  return {
+    answer,
+    sources: hits.map((h, index) => ({
+      ...sourceFromHit(h),
+      relevance_rank: index + 1,
+    })),
+  };
 }

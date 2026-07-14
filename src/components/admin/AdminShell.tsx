@@ -38,9 +38,14 @@ export function AdminShell({ children }: { children: React.ReactNode }) {
   const [openQueries, setOpenQueries] = useState<number | undefined>();
 
   useEffect(() => {
-    api.admin.metrics()
-      .then((r) => setOpenQueries(r.data.unanswered_open))
-      .catch(() => {});
+    api.admin.queries
+      .list('open', 1)
+      .then((r) => setOpenQueries(r.meta?.total ?? r.data.length))
+      .catch(() => {
+        api.admin.metrics()
+          .then((r) => setOpenQueries(r.data.unanswered_open))
+          .catch(() => {});
+      });
   }, [pathname]);
 
   return (

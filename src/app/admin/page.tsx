@@ -5,20 +5,115 @@ import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer
 } from 'recharts';
 import {
-  Users, MessageSquare, AlertTriangle, TrendingUp, Database,
+  Users, MessageSquare, AlertTriangle, TrendingUp, Database, RefreshCw,
 } from 'lucide-react';
 import Link from 'next/link';
+
+async function fetchMetricsWithRetry(attempts = 3): Promise<Metrics> {
+  let lastError: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const res = await api.admin.metrics();
+      return res.data;
+    } catch (err) {
+      lastError = err;
+      // Brief backoff — production DB sometimes returns intermittent 503s.
+      await new Promise((r) => setTimeout(r, 250 * (i + 1)));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error('Failed to load metrics');
+}
+
+/** Lighter endpoints when /admin/metrics fails. */
+async function fetchMetricsFallback(): Promise<Partial<Metrics>> {
+  const [usersRes, queriesRes] = await Promise.allSettled([
+    api.admin.users.list({ page: 1 }),
+    api.admin.queries.list('open', 1),
+  ]);
+
+  const partial: Partial<Metrics> = {
+    daily_activity: [],
+    top_faqs: [],
+    top_categories: [],
+  };
+
+  if (usersRes.status === 'fulfilled') {
+    partial.total_users = usersRes.value.meta?.total ?? usersRes.value.data.length;
+  }
+  if (queriesRes.status === 'fulfilled') {
+    partial.unanswered_open = queriesRes.value.meta?.total ?? queriesRes.value.data.length;
+  }
+
+  return partial;
+}
 
 export default function AdminDashboard() {
   const [metrics, setMetrics] = useState<Metrics | null>(null);
   const [health, setHealth] = useState<KnowledgeHealthReport | null>(null);
   const [loadingMetrics, setLoadingMetrics] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [partial, setPartial] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+
+  async function load(isRefresh = false) {
+    if (isRefresh) setRefreshing(true);
+    else setLoadingMetrics(true);
+    setError(null);
+    setPartial(false);
+
+    try {
+      const [metricsRes, healthRes] = await Promise.allSettled([
+        fetchMetricsWithRetry(3),
+        api.admin.knowledgeHealth(),
+      ]);
+
+      if (metricsRes.status === 'fulfilled') {
+        setMetrics(metricsRes.value);
+      } else {
+        try {
+          const fallback = await fetchMetricsFallback();
+          setMetrics({
+            total_users: fallback.total_users ?? 0,
+            active_today: 0,
+            total_questions: 0,
+            questions_today: 0,
+            unanswered_open: fallback.unanswered_open ?? 0,
+            new_users_30d: 0,
+            answer_rate_pct: 0,
+            top_categories: [],
+            top_faqs: [],
+            daily_activity: [],
+            ...fallback,
+          } as Metrics);
+          setPartial(true);
+          setError(
+            metricsRes.reason instanceof Error
+              ? metricsRes.reason.message
+              : 'Full metrics temporarily unavailable'
+          );
+        } catch {
+          setMetrics(null);
+          setError(
+            metricsRes.reason instanceof Error
+              ? metricsRes.reason.message
+              : 'Failed to load metrics'
+          );
+        }
+      }
+
+      if (healthRes.status === 'fulfilled') {
+        setHealth(healthRes.value.data);
+      } else {
+        setHealth(null);
+      }
+    } finally {
+      setLoadingMetrics(false);
+      setRefreshing(false);
+    }
+  }
 
   useEffect(() => {
-    Promise.all([
-      api.admin.metrics().then((r) => setMetrics(r.data)),
-      api.admin.knowledgeHealth().then((r) => setHealth(r.data)).catch(() => setHealth(null)),
-    ]).finally(() => setLoadingMetrics(false));
+    void load();
   }, []);
 
   if (loadingMetrics) {
@@ -30,13 +125,38 @@ export default function AdminDashboard() {
   }
 
   return (
-    <div className="px-8 py-6">
-      <h1 className="text-xl font-bold text-white mb-1">Dashboard</h1>
-      <p className="text-white/50 text-sm mb-8">Knowledge Base overview</p>
+    <div className="max-w-6xl mx-auto px-6 py-6">
+      <div className="flex items-start justify-between gap-4 mb-8">
+        <div>
+          <h1 className="text-xl font-bold text-white mb-1">Dashboard</h1>
+          <p className="text-white/50 text-sm">Knowledge Base overview</p>
+        </div>
+        <button
+          type="button"
+          onClick={() => void load(true)}
+          disabled={refreshing}
+          className="btn-secondary text-xs flex items-center gap-1.5 disabled:opacity-50"
+        >
+          <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
+          Refresh
+        </button>
+      </div>
+
+      {error && (
+        <div className="mb-6 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+          <p className="font-medium">
+            {partial ? 'Showing partial dashboard data' : 'Could not load dashboard metrics'}
+          </p>
+          <p className="text-amber-200/80 mt-1">{error}</p>
+          <p className="text-amber-200/60 mt-2 text-xs">
+            The API database connection is flaky. Use Refresh, or check MySQL on the PHP host.
+          </p>
+        </div>
+      )}
 
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
-        <MetricCard label="Total Users" value={metrics?.total_users ?? 0} icon={Users} color="blue" sub={`${metrics?.new_users_30d} new this month`} />
-        <MetricCard label="Questions Today" value={metrics?.questions_today ?? 0} icon={MessageSquare} color="purple" sub={`${metrics?.total_questions} total`} />
+        <MetricCard label="Total Users" value={metrics?.total_users ?? 0} icon={Users} color="blue" sub={`${metrics?.new_users_30d ?? 0} new this month`} />
+        <MetricCard label="Questions Today" value={metrics?.questions_today ?? 0} icon={MessageSquare} color="purple" sub={`${metrics?.total_questions ?? 0} total`} />
         <MetricCard label="Answer Rate" value={`${metrics?.answer_rate_pct ?? 0}%`} icon={TrendingUp} color="green" sub="last 30 days" />
         <MetricCard label="Open Queries" value={metrics?.unanswered_open ?? 0} icon={AlertTriangle} color="amber" sub="need admin reply" />
       </div>
@@ -90,23 +210,29 @@ export default function AdminDashboard() {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className="card p-5 lg:col-span-2">
           <h2 className="font-semibold text-white mb-4 text-sm">Daily activity (30 days)</h2>
-          <ResponsiveContainer width="100%" height={220}>
-            <BarChart data={metrics?.daily_activity ?? []}>
-              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.1)" />
-              <XAxis dataKey="date" tick={{ fontSize: 10, fill: 'rgba(255,255,255,0.5)' }} tickFormatter={(d) => d.slice(5)} />
-              <YAxis tick={{ fontSize: 10, fill: 'rgba(255,255,255,0.5)' }} />
-              <Tooltip
-                cursor={false}
-                contentStyle={{ background: '#003d52', border: '1px solid rgba(255,255,255,0.1)', color: '#fff' }}
-              />
-              <Bar
-                dataKey="count"
-                fill="#0ea5c9"
-                radius={[3, 3, 0, 0]}
-                activeBar={{ fill: '#38bdf8' }}
-              />
-            </BarChart>
-          </ResponsiveContainer>
+          {(metrics?.daily_activity?.length ?? 0) === 0 ? (
+            <p className="text-xs text-white/40 py-16 text-center">
+              {partial || error ? 'Activity chart unavailable while metrics API is down.' : 'No activity yet'}
+            </p>
+          ) : (
+            <ResponsiveContainer width="100%" height={220}>
+              <BarChart data={metrics?.daily_activity ?? []}>
+                <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.1)" />
+                <XAxis dataKey="date" tick={{ fontSize: 10, fill: 'rgba(255,255,255,0.5)' }} tickFormatter={(d) => d.slice(5)} />
+                <YAxis tick={{ fontSize: 10, fill: 'rgba(255,255,255,0.5)' }} />
+                <Tooltip
+                  cursor={false}
+                  contentStyle={{ background: '#003d52', border: '1px solid rgba(255,255,255,0.1)', color: '#fff' }}
+                />
+                <Bar
+                  dataKey="count"
+                  fill="#0ea5c9"
+                  radius={[3, 3, 0, 0]}
+                  activeBar={{ fill: '#38bdf8' }}
+                />
+              </BarChart>
+            </ResponsiveContainer>
+          )}
         </div>
 
         <div className="card p-5">
