@@ -24,6 +24,49 @@ function newMessageId(prefix = 'msg') {
   return `${prefix}-${crypto.randomUUID()}`;
 }
 
+/** Chip label — full name when short; acronym when long. */
+function categoryChipLabel(cat: Category): string {
+  const name = cat.name.trim();
+  if (name.length <= 18) return name;
+  return categoryShortLabel(cat);
+}
+
+/** Short chip label — prefers slug acronyms (SOM, HSEM), else initials. */
+function categoryShortLabel(cat: Category): string {
+  const slug = (cat.slug || '').trim();
+  if (slug) {
+    const compact = slug.replace(/[^a-z0-9]/gi, '');
+    if (compact.length >= 2 && compact.length <= 6) return compact.toUpperCase();
+    const fromParts = slug
+      .split(/[-_\s]+/)
+      .filter(Boolean)
+      .map((p) => p[0])
+      .join('')
+      .toUpperCase();
+    if (fromParts.length >= 2) return fromParts.slice(0, 5);
+  }
+  const words = cat.name.trim().split(/\s+/).filter(Boolean);
+  if (words.length >= 2) {
+    return words
+      .map((w) => w[0])
+      .join('')
+      .toUpperCase()
+      .slice(0, 5);
+  }
+  return (words[0] || cat.name).slice(0, 8);
+}
+
+const CATEGORY_PILL_TONES = [
+  { idle: 'border-sky-400/50 text-sky-300', active: 'bg-sky-400/20 border-sky-300 text-sky-100' },
+  { idle: 'border-emerald-400/50 text-emerald-300', active: 'bg-emerald-400/20 border-emerald-300 text-emerald-100' },
+  { idle: 'border-violet-400/50 text-violet-300', active: 'bg-violet-400/20 border-violet-300 text-violet-100' },
+  { idle: 'border-orange-400/50 text-orange-300', active: 'bg-orange-400/20 border-orange-300 text-orange-100' },
+  { idle: 'border-amber-400/50 text-amber-300', active: 'bg-amber-400/20 border-amber-300 text-amber-100' },
+  { idle: 'border-teal-400/50 text-teal-300', active: 'bg-teal-400/20 border-teal-300 text-teal-100' },
+  { idle: 'border-fuchsia-400/50 text-fuchsia-300', active: 'bg-fuchsia-400/20 border-fuchsia-300 text-fuchsia-100' },
+  { idle: 'border-blue-400/50 text-blue-300', active: 'bg-blue-400/20 border-blue-300 text-blue-100' },
+] as const;
+
 export function normalizeSessionId(id: string | number | null | undefined): string {
   return id == null ? '' : String(id);
 }
@@ -43,10 +86,11 @@ export function ChatWorkspace({ sessionId = null }: ChatWorkspaceProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [faqs, setFaqs] = useState<FAQ[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
+  const [categoriesLoading, setCategoriesLoading] = useState(true);
   const [question, setQuestion] = useState('');
   const [asking, setAsking] = useState(false);
   const [loadingSession, setLoadingSession] = useState(Boolean(activeSession));
-  const [selectedCat, setSelectedCat] = useState<number | undefined>();
+  const [selectedCats, setSelectedCats] = useState<number[]>([]);
   const [showFaqs, setShowFaqs] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [sessionSearch, setSessionSearch] = useState('');
@@ -59,6 +103,13 @@ export function ChatWorkspace({ sessionId = null }: ChatWorkspaceProps) {
     return sessions.filter((s) => (s.title || 'New chat').toLowerCase().includes(q));
   }, [sessions, sessionSearch]);
 
+  // Categories near the ask box: only those that currently have ready PDFs.
+  const categoriesWithPdfs = useMemo(() => {
+    const hasCounts = categories.some((c) => c.doc_count != null);
+    if (hasCounts) return categories.filter((c) => Number(c.doc_count) > 0);
+    return categories;
+  }, [categories]);
+
   useEffect(() => {
     if (!authLoading && !user) router.replace('/login');
   }, [user, authLoading, router]);
@@ -66,9 +117,51 @@ export function ChatWorkspace({ sessionId = null }: ChatWorkspaceProps) {
   useEffect(() => {
     if (!user) return;
     loadSessions();
-    loadFaqs();
-    api.chat.categories().then((r) => setCategories(r.data)).catch(() => {});
+    void loadCategoriesWithPdfs();
   }, [user]);
+
+  async function loadCategoriesWithPdfs() {
+    setCategoriesLoading(true);
+    try {
+      const r = await api.chat.categories();
+      const rows = Array.isArray(r.data) ? r.data : [];
+      setCategories(rows);
+    } catch {
+      setCategories([]);
+    } finally {
+      setCategoriesLoading(false);
+    }
+  }
+
+  // Drop selections if those categories no longer have PDFs.
+  useEffect(() => {
+    setSelectedCats((prev) => {
+      if (prev.length === 0) return prev;
+      const valid = new Set(categoriesWithPdfs.map((c) => c.id));
+      const next = prev.filter((id) => valid.has(id));
+      return next.length === prev.length ? prev : next;
+    });
+  }, [categoriesWithPdfs]);
+
+  useEffect(() => {
+    if (!user) return;
+    // FAQ strip: only filter when exactly one manual is selected.
+    loadFaqs(selectedCats.length === 1 ? selectedCats[0] : undefined);
+  }, [user, selectedCats]);
+
+  function toggleCategory(id: number) {
+    setSelectedCats((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+    );
+  }
+
+  const selectedCategoryNames = useMemo(
+    () =>
+      categoriesWithPdfs
+        .filter((c) => selectedCats.includes(c.id))
+        .map((c) => c.name),
+    [categoriesWithPdfs, selectedCats]
+  );
 
   // Load the session from the URL — show cache instantly, then refresh from API.
   useEffect(() => {
@@ -128,9 +221,9 @@ export function ChatWorkspace({ sessionId = null }: ChatWorkspaceProps) {
     }
   }
 
-  async function loadFaqs() {
+  async function loadFaqs(categoryId?: number) {
     try {
-      const r = await api.chat.faqs(undefined, 10);
+      const r = await api.chat.faqs(categoryId, 10);
       setFaqs(r.data);
     } catch {
       // ignore
@@ -183,7 +276,11 @@ export function ChatWorkspace({ sessionId = null }: ChatWorkspaceProps) {
     ]);
 
     try {
-      const r = await api.chat.ask(text, activeSession ?? undefined, selectedCat);
+      const r = await api.chat.ask(
+        text,
+        activeSession ?? undefined,
+        selectedCats.length > 0 ? selectedCats : undefined
+      );
       const { session_id, message_id, answer, sources, is_answered } = r.data;
       const sid = normalizeSessionId(activeSession ?? session_id);
       const isNew = !activeSession;
@@ -229,7 +326,7 @@ export function ChatWorkspace({ sessionId = null }: ChatWorkspaceProps) {
         void loadSessions();
       }
 
-      if (!is_answered) loadFaqs();
+      if (!is_answered) loadFaqs(selectedCats.length === 1 ? selectedCats[0] : undefined);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Something went wrong';
       setMessages((prev) => [
@@ -287,21 +384,6 @@ export function ChatWorkspace({ sessionId = null }: ChatWorkspaceProps) {
               onChange={(e) => setSessionSearch(e.target.value)}
             />
           </div>
-
-          <select
-            className="w-full text-xs border border-white/20 rounded-lg px-2 py-1.5 text-white/80 bg-white/5"
-            value={selectedCat ?? ''}
-            onChange={(e) => setSelectedCat(e.target.value ? Number(e.target.value) : undefined)}
-          >
-            <option value="" className="bg-brand text-white">
-              All categories
-            </option>
-            {categories.map((c) => (
-              <option key={c.id} value={c.id} className="bg-brand text-white">
-                {c.name}
-              </option>
-            ))}
-          </select>
         </div>
 
         <div className="flex-1 overflow-y-auto px-3 space-y-1">
@@ -425,8 +507,13 @@ export function ChatWorkspace({ sessionId = null }: ChatWorkspaceProps) {
               <h2 className="text-lg font-semibold text-white mb-2">Ask the knowledge base</h2>
               <p className="text-sm text-white/50 max-w-sm">
                 Type a question below. I&apos;ll search through
-                {categories.length > 0 ? ` ${categories.length} categories of ` : ' '}
+                {categoriesWithPdfs.length > 0
+                  ? ` ${categoriesWithPdfs.length} categories of `
+                  : ' '}
                 company documents and give you a concise answer with references.
+                {selectedCategoryNames.length > 0
+                  ? ` Currently filtered to ${selectedCategoryNames.join(', ')}.`
+                  : ''}
               </p>
               {faqs.length > 0 && (
                 <button
@@ -472,30 +559,85 @@ export function ChatWorkspace({ sessionId = null }: ChatWorkspaceProps) {
         </div>
 
         <div className="px-6 py-4 border-t border-white/10">
-          <div className="flex gap-3 items-end max-w-3xl mx-auto">
-            <textarea
-              className="flex-1 bg-white/5 border border-white/20 rounded-xl px-4 py-3 text-sm text-white placeholder:text-white/40 resize-none focus:outline-none focus:ring-2 focus:ring-brand-accent focus:border-transparent max-h-36"
-              placeholder="Ask a question about Nautilus Shipping policies, procedures, or documents…"
-              rows={1}
-              value={question}
-              onChange={(e) => setQuestion(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                  e.preventDefault();
-                  sendQuestion();
+          <div className="flex flex-col gap-3 max-w-3xl mx-auto">
+            {(categoriesLoading || categoriesWithPdfs.length > 0) && (
+              <div className="space-y-2">
+                <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-white/40">
+                Categories
+                </p>
+                <div
+                  className="flex flex-wrap gap-2"
+                  role="group"
+                  aria-label="Filter by category (multi-select)"
+                >
+                  {categoriesLoading &&
+                    [0, 1, 2, 3].map((i) => (
+                      <span
+                        key={i}
+                        className="h-8 w-16 rounded-full bg-white/10 animate-pulse"
+                        aria-hidden
+                      />
+                    ))}
+                  {!categoriesLoading &&
+                    categoriesWithPdfs.map((c, i) => {
+                      const active = selectedCats.includes(c.id);
+                      const tone = CATEGORY_PILL_TONES[i % CATEGORY_PILL_TONES.length];
+                      const short = categoryChipLabel(c);
+                      return (
+                        <button
+                          key={c.id}
+                          type="button"
+                          aria-pressed={active}
+                          title={
+                            c.doc_count != null
+                              ? `${c.name} · ${c.doc_count} PDF${c.doc_count === 1 ? '' : 's'}`
+                              : c.name
+                          }
+                          onClick={() => toggleCategory(c.id)}
+                          className={`rounded-full border px-3 py-1.5 text-xs font-semibold tracking-wide transition-colors ${
+                            active
+                              ? tone.active
+                              : `${tone.idle} opacity-45 hover:opacity-80`
+                          }`}
+                        >
+                          {short}
+                        </button>
+                      );
+                    })}
+                </div>
+              </div>
+            )}
+            <div className="flex gap-3 items-end">
+              <textarea
+                className="flex-1 bg-white/5 border border-white/20 rounded-xl px-4 py-3 text-sm text-white placeholder:text-white/40 resize-none focus:outline-none focus:ring-2 focus:ring-brand-accent focus:border-transparent max-h-36"
+                placeholder={
+                  selectedCategoryNames.length > 0
+                    ? `Ask about ${selectedCategoryNames.join(', ')}…`
+                    : 'e.g. enclosed space entry, hot work permit, bunkering, mooring…'
                 }
-              }}
-            />
-            <button
-              onClick={() => sendQuestion()}
-              disabled={!question.trim() || asking}
-              className="btn-primary p-3 rounded-xl flex-shrink-0"
-            >
-              <Send className="w-4 h-4" />
-            </button>
+                rows={1}
+                value={question}
+                onChange={(e) => setQuestion(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    sendQuestion();
+                  }
+                }}
+              />
+              <button
+                onClick={() => sendQuestion()}
+                disabled={!question.trim() || asking}
+                className="btn-primary p-3 rounded-xl flex-shrink-0"
+              >
+                <Send className="w-4 h-4" />
+              </button>
+            </div>
           </div>
           <p className="text-xs text-white/40 text-center mt-2">
-            Answers are sourced from approved company documents only.
+            {selectedCategoryNames.length > 0
+              ? `Searching ${selectedCategoryNames.join(', ')} manuals only.`
+              : 'Answers are sourced from approved company documents only.'}
           </p>
         </div>
       </main>
@@ -553,7 +695,9 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
           {msg.is_answered === 0 && (
             <div className="flex items-center gap-1.5 text-amber-300 text-xs font-medium mb-2">
               <AlertTriangle className="w-3.5 h-3.5" />
-              Not found in documents
+              {/selected categor/i.test(msg.answer || '')
+                ? 'Not found in selected category'
+                : 'Not found in documents'}
             </div>
           )}
           <p className="text-white/90 leading-relaxed whitespace-pre-wrap">{msg.answer}</p>
@@ -564,7 +708,7 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
             <p className="text-[11px] font-medium uppercase tracking-wide text-white/40">
               Sources
             </p>
-            <div className="flex flex-wrap gap-2">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
               {msg.sources.map((src, i) => (
                 <SourceBadge
                   key={`${src.fileId ?? src.document_id ?? i}-${src.pageNumber ?? src.page_number ?? i}`}
@@ -605,22 +749,39 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
 function SourceBadge({ source }: { source: MessageSource }) {
   const fileName = getSourceFileName(source);
   const pageLabel = getSourcePageLabel(source);
+  const categoryName = source.category_name?.trim() || null;
   const token = typeof window !== 'undefined' ? localStorage.getItem('nk_token') : null;
   const href = token ? buildSourcePdfUrl(source, token) : undefined;
   const openLabel = pageLabel ? `Open PDF — ${pageLabel}` : 'Open PDF';
-  const title = pageLabel ? `Open ${fileName} at ${pageLabel}` : `Open ${fileName}`;
+  const titleParts = [fileName];
+  if (categoryName) titleParts.push(`Category: ${categoryName}`);
+  if (pageLabel) titleParts.push(pageLabel);
+  const title = titleParts.join(' · ');
+
+  const content = (
+    <>
+      <FileText className="w-3.5 h-3.5 flex-shrink-0 text-white/70" />
+      <span className="min-w-0 flex-1 flex flex-col gap-0.5">
+        <span className="font-medium truncate">{fileName}</span>
+        {categoryName && (
+          <span className="truncate text-[10px] text-white/45 font-normal normal-case tracking-normal">
+            {categoryName}
+          </span>
+        )}
+      </span>
+      <span className="flex-shrink-0 rounded-md bg-brand-accent/20 text-brand-accent border border-brand-accent/30 px-1.5 py-0.5 font-semibold tabular-nums whitespace-nowrap">
+        {openLabel}
+      </span>
+    </>
+  );
 
   if (!href) {
     return (
       <span
         title="Please log in again to view documents"
-        className="inline-flex items-center gap-1.5 bg-white/10 text-white/50 text-xs rounded-lg px-2.5 py-1.5 border border-white/20 max-w-full cursor-not-allowed"
+        className="flex w-full min-w-0 items-center gap-2 bg-white/10 text-white/50 text-xs rounded-lg px-2.5 py-2 border border-white/20 cursor-not-allowed"
       >
-        <FileText className="w-3 h-3 flex-shrink-0" />
-        <span className="font-medium truncate max-w-[200px]">{fileName}</span>
-        <span className="flex-shrink-0 rounded-md bg-brand-accent/20 text-brand-accent border border-brand-accent/30 px-1.5 py-0.5 font-semibold tabular-nums">
-          {openLabel}
-        </span>
+        {content}
       </span>
     );
   }
@@ -631,13 +792,9 @@ function SourceBadge({ source }: { source: MessageSource }) {
       target="_blank"
       rel="noopener noreferrer"
       title={title}
-      className="inline-flex items-center gap-1.5 bg-white/10 text-white/80 text-xs rounded-lg px-2.5 py-1.5 border border-white/20 hover:bg-white/20 hover:border-white/30 transition-colors cursor-pointer max-w-full"
+      className="flex w-full min-w-0 items-center gap-2 bg-white/10 text-white/80 text-xs rounded-lg px-2.5 py-2 border border-white/20 hover:bg-white/20 hover:border-white/30 transition-colors cursor-pointer"
     >
-      <FileText className="w-3 h-3 flex-shrink-0" />
-      <span className="font-medium truncate max-w-[160px]">{fileName}</span>
-      <span className="flex-shrink-0 rounded-md bg-brand-accent/20 text-brand-accent border border-brand-accent/30 px-1.5 py-0.5 font-semibold tabular-nums whitespace-nowrap">
-        {openLabel}
-      </span>
+      {content}
     </a>
   );
 }

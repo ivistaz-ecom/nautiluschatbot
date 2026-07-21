@@ -148,7 +148,7 @@ export default function AdminDocuments() {
 
     setSavingEdit(true);
     try {
-      await api.admin.documents.update(editingDoc.id, {
+      const res = await api.admin.documents.update(editingDoc.id, {
         title: editForm.title.trim(),
         category_id: Number(editForm.category_id),
         original_filename: editForm.original_filename.trim() || undefined,
@@ -157,7 +157,14 @@ export default function AdminDocuments() {
 
       closeEdit();
       load();
-      setSuccessMessage('Document updated successfully.');
+      if ((res as { local_only?: boolean }).local_only) {
+        setSuccessMessage(
+          (res as { message?: string }).message ||
+            'Saved locally only — live category counts/chat may not update until the PHP update endpoint is deployed.'
+        );
+      } else {
+        setSuccessMessage('Document updated successfully.');
+      }
     } catch (err: unknown) {
       alert(err instanceof Error ? err.message : 'Failed to update document');
     } finally {
