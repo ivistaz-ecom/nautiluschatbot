@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { resolveAssistantTurn } from '@/lib/chat-source-attribution';
+import { resolveAssistantTurn, mergeAssistantSources } from '@/lib/chat-source-attribution';
 import { API_BACKEND_URL } from '@/lib/api-config';
 
 export const dynamic = 'force-dynamic';
@@ -33,14 +33,25 @@ export async function POST(req: NextRequest) {
   }
 
   const question = typeof body?.question === 'string' ? body.question : '';
+  const categoryId =
+    body?.category_id != null && Number(body.category_id) > 0
+      ? Number(body.category_id)
+      : undefined;
   const answer = typeof data.answer === 'string' ? data.answer : '';
   const isAnswered = Boolean(data.is_answered);
   const rawSources = Array.isArray(data.sources) ? data.sources : [];
 
-  const resolved = await resolveAssistantTurn(auth, question, answer, isAnswered, rawSources);
+  const resolved = await resolveAssistantTurn(
+    auth,
+    question,
+    answer,
+    isAnswered,
+    rawSources,
+    categoryId
+  );
   data.answer = resolved.answer;
   data.is_answered = resolved.is_answered;
-  data.sources = resolved.sources;
+  data.sources = mergeAssistantSources(auth, resolved.sources, rawSources);
   payload.data = data;
 
   return NextResponse.json(payload);

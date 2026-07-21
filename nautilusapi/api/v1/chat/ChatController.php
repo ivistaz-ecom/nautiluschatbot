@@ -132,6 +132,7 @@ class ChatController {
                 fn($c) => !DocumentParser::isTableOfContentsChunk($c['content'] ?? '')
             ));
             if (empty($chunks)) {
+                // Keep answering when only TOC-tagged chunks remain — frontend still grounds pages.
                 $chunks = $allChunks;
             }
         }
@@ -229,12 +230,17 @@ class ChatController {
             $sources = $result['sources'];
         }
 
-        // Absolute last resort: build one source from the top retrieved chunk
+        // Absolute last resort: first non-TOC retrieved chunk (never an index page)
         if ($result['answered'] && empty($sources) && !empty($allChunks)) {
-            $sources = $this->enrichSources([
-                SourceAttributor::chunkToSource($allChunks[0]),
-            ]);
-            Logger::warn('[chat-response] last-resort source from allChunks[0]');
+            $nonToc = SourceAttributor::firstNonTocChunk($allChunks)
+                ?? SourceAttributor::firstNonTocChunk($chunks);
+            if ($nonToc !== null) {
+                $sources = $this->enrichSources([
+                    SourceAttributor::chunkToSource($nonToc),
+                ]);
+                Logger::warn('[chat-response] last-resort source from non-TOC chunk page='
+                    . ($nonToc['page_number'] ?? '?'));
+            }
         }
 
         Logger::info('[chat-response] sources.length=' . count($sources)
@@ -265,6 +271,7 @@ class ChatController {
         $question   = trim(strip_tags(Request::get('q') ?? Request::get('question') ?? ''));
         $answer     = trim(strip_tags(Request::get('answer') ?? ''));
         $documentId = Request::get('document_id') ? (int) Request::get('document_id') : null;
+        $categoryId = Request::get('category_id') ? (int) Request::get('category_id') : null;
 
         if (mb_strlen($question) < 3) {
             Response::error('Question too short', 422);
@@ -272,7 +279,7 @@ class ChatController {
         }
 
         $cfg       = require __DIR__ . '/../../../config/config.php';
-        $retrieval = $this->retrieveChunks($question, null, 20);
+        $retrieval = $this->retrieveChunks($question, $categoryId, 20);
         $chunks    = $retrieval['for_fallback'];
 
         $chunks = array_values(array_filter(
@@ -366,11 +373,16 @@ class ChatController {
                      "page_number", NULLIF(s.page_number, 0),
                      "relevance_rank", s.relevance_rank,
                      "mime_type", d.mime_type,
+                     "category_id", d.category_id,
+                     "category_name", c.name,
                      "fileId", s.document_id,
                      "fileName", d.title,
                      "pageNumber", NULLIF(s.page_number, 0)
                  )
-             ) FROM message_sources s JOIN documents d ON d.id = s.document_id WHERE s.message_id = m.id) AS sources
+             ) FROM message_sources s
+                JOIN documents d ON d.id = s.document_id
+                JOIN categories c ON c.id = d.category_id
+                WHERE s.message_id = m.id) AS sources
              FROM chat_messages m
              WHERE m.session_id = ?
              ORDER BY m.created_at ASC',
@@ -429,6 +441,40 @@ class ChatController {
              FROM categories
              ORDER BY sort_order ASC, name ASC'
         );
+        Response::success($rows);
+    }
+
+    /**
+     * List indexed documents available for chat retrieval (scoped to categories).
+     */
+    public function documents(array $params = []): void {
+        AuthMiddleware::require();
+
+        $categoryId = Request::get('category_id') ? (int) Request::get('category_id') : null;
+        $status     = Request::get('status') ?: 'ready';
+
+        $where = ['d.category_id IS NOT NULL'];
+        $binds = [];
+
+        if ($categoryId) {
+            $where[] = 'd.category_id = ?';
+            $binds[] = $categoryId;
+        }
+        if ($status !== '') {
+            $where[] = 'd.status = ?';
+            $binds[] = $status;
+        }
+
+        $whereStr = implode(' AND ', $where);
+        $rows = Database::query(
+            "SELECT d.id, d.title, d.original_filename, d.mime_type, d.category_id, c.name AS category_name
+             FROM documents d
+             JOIN categories c ON c.id = d.category_id
+             WHERE $whereStr
+             ORDER BY c.sort_order ASC, c.name ASC, d.title ASC",
+            $binds
+        );
+
         Response::success($rows);
     }
 
@@ -501,6 +547,8 @@ class ChatController {
                 'page_label'     => $pageLabel,
                 'relevance_rank' => $src['relevance_rank'] ?? null,
                 'mime_type'      => $src['mime_type'] ?? 'application/pdf',
+                'category_id'    => isset($src['category_id']) ? (int) $src['category_id'] : null,
+                'category_name'  => $src['category_name'] ?? null,
                 'fileId'         => $fileId,
                 'fileName'       => $fileName,
                 'pageNumber'     => $pageNumber,
@@ -523,12 +571,30 @@ class ChatController {
     }
 
     private function detectCategory(string $question): ?int {
-        $categories = Database::query('SELECT id, name FROM categories');
+        $categories = Database::query('SELECT id, name FROM categories ORDER BY CHAR_LENGTH(name) DESC');
         $q = mb_strtolower($question);
 
         foreach ($categories as $cat) {
-            if (str_contains($q, mb_strtolower($cat['name']))) {
+            $name = mb_strtolower(trim($cat['name']));
+            if ($name !== '' && str_contains($q, $name)) {
                 return (int) $cat['id'];
+            }
+
+            // Multi-word categories (e.g. "Ship Operating") — require two significant word hits.
+            $words = array_values(array_filter(
+                preg_split('/\s+/u', $name) ?: [],
+                fn($w) => mb_strlen($w) >= 4
+            ));
+            if (count($words) >= 2) {
+                $hits = 0;
+                foreach ($words as $word) {
+                    if (str_contains($q, $word)) {
+                        $hits++;
+                    }
+                }
+                if ($hits >= 2) {
+                    return (int) $cat['id'];
+                }
             }
         }
         return null;
@@ -549,20 +615,25 @@ class ChatController {
             $chunks = $this->searchChunks($terms['boolean'], $categoryId, $fetchLimit, 'boolean');
         }
 
+        // Typo-tolerant pass: prefix wildcards recover misspelled words.
+        if (empty($chunks) && ($terms['fuzzy'] ?? '') !== '' && $terms['fuzzy'] !== $terms['boolean']) {
+            $chunks = $this->searchChunks($terms['fuzzy'], $categoryId, $fetchLimit, 'boolean');
+            if (!empty($chunks)) {
+                Logger::info('[retrieval] fuzzy prefix search matched after exact search failed');
+            }
+        }
+
         if (empty($chunks) && !empty($terms['keywords'])) {
             $chunks = $this->likeSearchChunks($terms['keywords'], $categoryId, $fetchLimit);
         }
 
-        // Widen to all categories if a filtered search returned too little
-        if (count($chunks) < min(3, $fetchLimit) && $categoryId) {
-            $more = $this->searchChunks($terms['natural'], null, $fetchLimit, 'natural');
-            if (empty($more) && $terms['boolean'] !== '') {
-                $more = $this->searchChunks($terms['boolean'], null, $fetchLimit, 'boolean');
-            }
-            if (empty($more) && !empty($terms['keywords'])) {
-                $more = $this->likeSearchChunks($terms['keywords'], null, $fetchLimit);
-            }
-            $chunks = $this->mergeChunks($chunks, $more, $fetchLimit);
+        // LIKE with typo-tolerant prefixes as the final lexical fallback.
+        if (empty($chunks) && !empty($terms['keywords'])) {
+            $prefixes = array_map(
+                fn($w) => strlen($w) >= 6 ? substr($w, 0, max(4, strlen($w) - 3)) : $w,
+                $terms['keywords']
+            );
+            $chunks = $this->likeSearchChunks($prefixes, $categoryId, $fetchLimit);
         }
 
         $chunks = $this->filterUsefulChunks($chunks);
@@ -589,6 +660,7 @@ class ChatController {
 
         Logger::info("[retrieval]\n"
             . 'question=' . mb_substr($question, 0, 80) . "\n"
+            . 'category_id=' . ($categoryId ?? 'all') . "\n"
             . 'retrieved_chunk_count=' . count($forFallback) . "\n"
             . 'after_toc_filter_count=' . count($forLlm) . "\n"
             . "Retrieved chunks:\n"
@@ -688,6 +760,14 @@ class ChatController {
                 fn($w) => strlen($w) >= 3 ? $w . '*' : $w,
                 $top
             )),
+            // Typo-tolerant boolean pass: prefix wildcards so a misspelled
+            // ending ("proceduer") still matches the indexed word ("procedure").
+            'fuzzy'    => implode(' ', array_map(
+                fn($w) => strlen($w) >= 6
+                    ? substr($w, 0, max(4, strlen($w) - 3)) . '*'
+                    : (strlen($w) >= 3 ? $w . '*' : $w),
+                $top
+            )),
             'keywords' => array_slice($top, 0, 5),
         ];
     }
@@ -708,11 +788,13 @@ class ChatController {
         try {
             return Database::query(
                 "SELECT dc.document_id, dc.page_number, dc.content,
-                        d.title, d.mime_type,
+                        d.title, d.mime_type, d.category_id, c.name AS category_name,
                         MATCH(dc.content) AGAINST (? IN $modeSql) AS score
                  FROM document_chunks dc
                  JOIN documents d ON d.id = dc.document_id AND d.status = 'ready'
+                 JOIN categories c ON c.id = d.category_id
                  WHERE MATCH(dc.content) AGAINST (? IN $modeSql)
+                 AND d.category_id IS NOT NULL
                  $categorySql
                  ORDER BY score DESC
                  LIMIT ?",
@@ -748,10 +830,12 @@ class ChatController {
 
         return Database::query(
             'SELECT dc.document_id, dc.page_number, dc.content,
-                    d.title, d.mime_type, 1.0 AS score
+                    d.title, d.mime_type, d.category_id, c.name AS category_name, 1.0 AS score
              FROM document_chunks dc
              JOIN documents d ON d.id = dc.document_id AND d.status = \'ready\'
+             JOIN categories c ON c.id = d.category_id
              WHERE (' . implode(' OR ', $likes) . ")
+             AND d.category_id IS NOT NULL
              $categorySql
              ORDER BY dc.document_id, dc.page_number
              LIMIT ?",
@@ -794,6 +878,7 @@ class ChatController {
 
         $reranker = new ChunkReranker();
         $ranked   = $reranker->rerank($chunks, $question);
+        $qTokens  = $this->significantQuestionTokens($question);
 
         foreach ($ranked as $chunk) {
             $content = trim((string) ($chunk['content'] ?? ''));
@@ -809,23 +894,7 @@ class ChatController {
                 continue;
             }
 
-            $sentences = preg_split('/[.!?]+/u', $content, -1, PREG_SPLIT_NO_EMPTY) ?: [];
-            $parts     = [];
-            foreach ($sentences as $sentence) {
-                $sentence = trim($sentence);
-                if (mb_strlen($sentence) < 20) {
-                    continue;
-                }
-                $parts[] = $sentence;
-                if (mb_strlen(implode('. ', $parts)) >= 420) {
-                    break;
-                }
-            }
-
-            $answer = trim(implode('. ', $parts));
-            if ($answer !== '' && !str_ends_with($answer, '.')) {
-                $answer .= '.';
-            }
+            $answer = $this->extractRelevantPassage($content, $qTokens);
             if (mb_strlen($answer) < 40) {
                 continue;
             }
@@ -845,6 +914,188 @@ class ChatController {
         }
 
         return null;
+    }
+
+    /** @return array<int, string> */
+    private function significantQuestionTokens(string $question): array {
+        $stop = [
+            'the','and','for','that','with','this','from','what','when','where',
+            'which','who','how','why','does','did','are','was','were','have',
+            'please','tell','explain','describe','define','about','into',
+        ];
+        $words = preg_split('/[^a-z0-9]+/i', strtolower($question)) ?: [];
+        $tokens = [];
+        foreach ($words as $w) {
+            if (strlen($w) < 4 || in_array($w, $stop, true)) {
+                continue;
+            }
+            $tokens[] = $w;
+        }
+        return array_values(array_unique($tokens));
+    }
+
+    /**
+     * Pull a detailed passage around the sentences that best match the question.
+     */
+    private function extractRelevantPassage(string $content, array $qTokens): string {
+        $normalized = trim(preg_replace('/\s+/u', ' ', $content) ?? $content);
+        $units = preg_split(
+            '/(?=\b[a-z]\)\s+)|(?<=[.!?])\s+(?=[A-Z(\[\d])/u',
+            $normalized
+        ) ?: [];
+        $units = array_values(array_filter(array_map('trim', $units), fn($u) => mb_strlen($u) >= 12));
+        if (empty($units)) {
+            return mb_substr($normalized, 0, 1400);
+        }
+
+        $bestIdx = 0;
+        $bestScore = -1.0;
+        foreach ($units as $i => $unit) {
+            $lower = strtolower($unit);
+            $hits = 0;
+            foreach ($qTokens as $token) {
+                if (str_contains($lower, $token)) {
+                    $hits++;
+                }
+            }
+            $score = empty($qTokens) ? 0.0 : $hits / count($qTokens);
+            if ($score > $bestScore) {
+                $bestScore = $score;
+                $bestIdx = $i;
+            }
+        }
+
+        // Include a nearby section heading when present.
+        $start = $bestIdx;
+        for ($i = $bestIdx; $i >= max(0, $bestIdx - 3); $i--) {
+            $u = $units[$i];
+            if (preg_match('/^[a-z]\)\s+\S+/i', $u) && !preg_match('/[.!?]$/u', $u) && mb_strlen($u) < 160) {
+                $start = $i;
+                break;
+            }
+            if ($i === $bestIdx - 1 && mb_strlen($u) < 220) {
+                $start = $i;
+            }
+        }
+
+        $parts = [];
+        $length = 0;
+        $count = count($units);
+        for ($i = $start; $i < $count; $i++) {
+            $unit = $units[$i];
+
+            // Stop at the next major heading after we already have content.
+            if (
+                $i > $bestIdx
+                && count($parts) >= 2
+                && preg_match('/^[a-z]\)\s+\S+/i', $unit)
+                && !preg_match('/[.!?]|(See\s+HSEQ|Procedure|–|-)/i', $unit)
+                && mb_strlen($unit) < 120
+            ) {
+                break;
+            }
+
+            $next = $length + mb_strlen($unit) + (empty($parts) ? 0 : 1);
+            if (!empty($parts) && $next > 1400) {
+                break;
+            }
+            $parts[] = $unit;
+            $length = $next;
+
+            // After matching content, keep following list items then stop.
+            if ($i > $bestIdx && $length >= 450 && preg_match('/^[a-z]\)\s+/i', $unit)) {
+                $following = $units[$i + 1] ?? null;
+                if ($following === null || !preg_match('/^[a-z]\)\s+/i', $following)) {
+                    break;
+                }
+            }
+        }
+
+        $answer = $this->formatAnswerBlocks($parts);
+        if ($answer !== '' && !preg_match('/[.!?…]$/u', trim($answer))) {
+            $answer .= '.';
+        }
+        return $answer;
+    }
+
+    /**
+     * Format heading / paragraph / list items on separate lines for readable chat replies.
+     *
+     * @param array<int, string> $parts
+     */
+    private function formatAnswerBlocks(array $parts): string {
+        $cleaned = array_values(array_filter(array_map(
+            fn($p) => trim(preg_replace('/\s+/u', ' ', $p) ?? $p),
+            $parts
+        )));
+        if (empty($cleaned)) {
+            return '';
+        }
+        if (count($cleaned) === 1) {
+            return $cleaned[0];
+        }
+
+        $isHeading = function (string $t): bool {
+            if (mb_strlen($t) < 8 || mb_strlen($t) > 160) {
+                return false;
+            }
+            return (bool) (
+                preg_match('/^[a-z]\)\s+\S+/i', $t)
+                && !preg_match('/[.!?]$/u', $t)
+                && !preg_match('/(See\s+|–|—)/u', $t)
+                && mb_strlen($t) < 120
+            );
+        };
+        $isListItem = function (string $t) use ($isHeading): bool {
+            if (!preg_match('/^[a-z]\)\s+/i', $t)) {
+                return false;
+            }
+            if ($isHeading($t)) {
+                return false;
+            }
+            return (bool) (
+                preg_match('/(See\s+|–|—)/u', $t)
+                || preg_match('/[.!?]$/u', $t)
+                || mb_strlen($t) >= 80
+            );
+        };
+
+        $lines = [];
+        foreach ($cleaned as $i => $unit) {
+            $prev = $i > 0 ? $cleaned[$i - 1] : '';
+
+            if ($isHeading($unit)) {
+                if (!empty($lines)) {
+                    $lines[] = '';
+                }
+                $lines[] = $unit;
+                continue;
+            }
+
+            if ($isListItem($unit) || preg_match('/^[a-z]\)\s+/i', $unit)) {
+                if (
+                    !empty($lines)
+                    && $prev !== ''
+                    && !$isListItem($prev)
+                    && !preg_match('/^[a-z]\)\s+/i', $prev)
+                ) {
+                    $lines[] = '';
+                }
+                $lines[] = $unit;
+                continue;
+            }
+
+            if (
+                !empty($lines)
+                && ($isHeading($prev) || $isListItem($prev) || preg_match('/^[a-z]\)\s+/i', $prev) || mb_strlen($prev) > 120)
+            ) {
+                $lines[] = '';
+            }
+            $lines[] = $unit;
+        }
+
+        $text = trim(implode("\n", $lines));
+        return preg_replace("/\n{3,}/", "\n\n", $text) ?? $text;
     }
 
     private function persistMessage(

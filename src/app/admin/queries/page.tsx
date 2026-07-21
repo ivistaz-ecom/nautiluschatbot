@@ -1,7 +1,7 @@
 'use client';
 import { useState, useEffect } from 'react';
 import { api, UnansweredQuery } from '@/lib/api';
-import { Send, CheckCircle, MessageSquare } from 'lucide-react';
+import { Send, CheckCircle, MessageSquare, Trash2 } from 'lucide-react';
 
 export default function AdminQueries() {
   const [queries, setQueries] = useState<UnansweredQuery[]>([]);
@@ -10,6 +10,7 @@ export default function AdminQueries() {
   const [status, setStatus] = useState('open');
   const [answers, setAnswers] = useState<Record<number, string>>({});
   const [saving, setSaving] = useState<Record<number, boolean>>({});
+  const [deleting, setDeleting] = useState<Record<number, boolean>>({});
 
   useEffect(() => {
     load();
@@ -33,16 +34,28 @@ export default function AdminQueries() {
     }
   }
 
+  async function handleDelete(id: number) {
+    if (!confirm('Delete this query? This cannot be undone.')) return;
+    setDeleting(p => ({ ...p, [id]: true }));
+    try {
+      await api.admin.queries.delete(id);
+      setQueries(prev => prev.filter(q => q.id !== id));
+      setTotal(t => t - 1);
+    } finally {
+      setDeleting(p => ({ ...p, [id]: false }));
+    }
+  }
+
   return (
     <div className="max-w-6xl mx-auto px-6 py-6">
       <div className="flex items-center gap-3 mb-6">
         <h1 className="text-xl font-bold text-white">Unanswered Queries</h1>
-        <span className="text-white/50 text-sm">{total} results</span>
+        <span className="text-white/80 text-sm">{total} results</span>
 
         <div className="ml-auto flex gap-2">
           {['open', 'answered', 'dismissed'].map(s => (
             <button key={s} onClick={() => { setStatus(s); setPage(1); }}
-              className={`px-3 py-1.5 text-xs rounded-lg font-medium capitalize transition-colors ${status === s ? 'bg-brand-accent text-white' : 'bg-white/10 text-white/70 hover:bg-white/15'}`}>
+              className={`px-3 py-1.5 text-xs rounded-lg font-medium capitalize transition-colors ${status === s ? 'bg-brand-accent text-white' : 'bg-white/10 text-white hover:bg-white/15'}`}>
               {s}
             </button>
           ))}
@@ -53,7 +66,7 @@ export default function AdminQueries() {
         {queries.map(q => (
           <div key={q.id} className="card p-5">
             <div className="flex items-start justify-between gap-4 mb-3">
-              <div className="flex items-center gap-2 text-xs text-white/50">
+              <div className="flex items-center gap-2 text-xs text-white">
                 <div className="w-6 h-6 bg-white/10 rounded-full flex items-center justify-center text-white font-medium text-xs">
                   {q.user_name[0]}
                 </div>
@@ -63,10 +76,20 @@ export default function AdminQueries() {
                 <span>·</span>
                 <span>{new Date(q.created_at).toLocaleDateString()}</span>
               </div>
-              <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
-                q.status === 'open' ? 'bg-amber-500/20 text-amber-300' :
-                q.status === 'answered' ? 'bg-green-500/20 text-green-300' : 'bg-white/10 text-white/50'
-              }`}>{q.status}</span>
+              <div className="flex items-center gap-2">
+                <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
+                  q.status === 'open' ? 'bg-amber-500/20 text-amber-300' :
+                  q.status === 'answered' ? 'bg-green-500/20 text-green-300' : 'bg-white/10 text-white/50'
+                }`}>{q.status}</span>
+                <button
+                  onClick={() => handleDelete(q.id)}
+                  disabled={deleting[q.id]}
+                  title="Delete query"
+                  className="p-1.5 rounded-lg text-white/40 hover:text-red-400 hover:bg-red-500/10 transition-colors disabled:opacity-50"
+                >
+                  {/* <Trash2 className="w-3.5 h-3.5" /> */}
+                </button>
+              </div>
             </div>
 
             <div className="bg-white/5 rounded-lg p-3 mb-4">

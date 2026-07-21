@@ -92,8 +92,8 @@ export default function AdminCategories() {
                     <span className="font-medium text-white">{cat.name}</span>
                   )}
                 </td>
-                <td className="px-4 py-3 text-white/50 text-xs">{cat.parent_name || '—'}</td>
-                <td className="px-4 py-3 text-white/50 text-xs">{cat.doc_count ?? 0}</td>
+                <td className="px-4 py-3 text-white text-xs">{cat.parent_name || '—'}</td>
+                <td className="px-4 py-3 text-white text-xs">{cat.doc_count ?? 0}</td>
                 <td className="px-4 py-3">
                   <div className="flex items-center gap-1">
                     {editing?.id === cat.id ? (
@@ -101,16 +101,16 @@ export default function AdminCategories() {
                         <button onClick={handleUpdate} className="p-1.5 text-green-400 hover:bg-green-500/10 rounded">
                           <Check className="w-3.5 h-3.5" />
                         </button>
-                        <button onClick={() => setEditing(null)} className="p-1.5 text-white/40 hover:bg-white/10 rounded">
+                        <button onClick={() => setEditing(null)} className="p-1.5 text-white hover:bg-white/10 rounded">
                           <X className="w-3.5 h-3.5" />
                         </button>
                       </>
                     ) : (
                       <>
-                        <button onClick={() => setEditing(cat)} className="p-1.5 text-white/40 hover:text-blue-400 rounded">
+                        <button onClick={() => setEditing(cat)} className="p-1.5 text-white hover:text-blue-400 rounded">
                           <Edit2 className="w-3.5 h-3.5" />
                         </button>
-                        <button onClick={() => handleDelete(cat.id)} className="p-1.5 text-white/40 hover:text-red-400 rounded">
+                        <button onClick={() => handleDelete(cat.id)} className="p-1.5 text-white hover:text-red-400 rounded">
                           <Trash2 className="w-3.5 h-3.5" />
                         </button>
                       </>

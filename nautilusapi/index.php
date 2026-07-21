@@ -82,6 +82,7 @@ $router->get   ('/chat/sessions/:id',         [ChatController::class, 'session']
 $router->delete('/chat/sessions/:id',         [ChatController::class, 'deleteSession']);
 $router->get   ('/chat/faqs',                 [ChatController::class, 'faqs']);
 $router->get   ('/chat/categories',           [ChatController::class, 'categories']);
+$router->get   ('/chat/documents',            [ChatController::class, 'documents']);
 $router->post  ('/chat/submit-query',         [ChatController::class, 'submitQuery']);
 $router->get   ('/chat/documents/:id/file',   [DocumentController::class, 'serveFile']);
 
@@ -113,6 +114,8 @@ $router->put   ('/admin/whitelist/:id/toggle',[AdminController::class, 'whitelis
 
 $router->get   ('/admin/queries',             [AdminController::class, 'queriesIndex']);
 $router->post  ('/admin/queries/:id/answer',  [AdminController::class, 'queriesAnswer']);
+$router->delete('/admin/queries/:id',         [AdminController::class, 'queriesDelete']);
+$router->post  ('/admin/queries/:id/delete',  [AdminController::class, 'queriesDelete']);
 $router->get   ('/admin/questions',           [AdminController::class, 'allQuestions']);
 
 $router->get   ('/admin/metrics',             [AdminController::class, 'metrics']);

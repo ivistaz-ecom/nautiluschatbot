@@ -1,7 +1,7 @@
 'use client';
 import { useState, useEffect, useRef } from 'react';
-import { api, Document, Category } from '@/lib/api';
-import { Upload, Trash2, RefreshCw, FileText, Search, Edit2, X, Check } from 'lucide-react';
+import { api, Document, Category, openAdminDocument } from '@/lib/api';
+import { Upload, Trash2, RefreshCw, FileText, Search, Edit2, X, Check, ExternalLink } from 'lucide-react';
 
 type EditForm = { title: string; original_filename: string; category_id: string };
 
@@ -358,13 +358,30 @@ export default function AdminDocuments() {
               {docs.map(doc => (
                 <tr key={doc.id} className="hover:bg-white/10 hover:shadow-sm">
                   <td className="px-4 py-3">
-                    <div className="flex items-center gap-2">
-                      <FileText className="w-4 h-4 text-gray-400 flex-shrink-0" />
-                      <div>
-                        <p className="font-medium text-gray-100">{doc.title}</p>
-                        <p className="text-xs text-gray-400">{doc.original_filename}</p>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        try {
+                          openAdminDocument(doc.id, doc.status);
+                        } catch (err: unknown) {
+                          alert(err instanceof Error ? err.message : 'Unable to open document');
+                        }
+                      }}
+                      disabled={doc.file_on_disk === false}
+                      title={doc.file_on_disk === false ? 'File missing on server' : 'Open document'}
+                      className="flex items-center gap-2 text-left group disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      <FileText className="w-4 h-4 text-gray-400 flex-shrink-0 group-hover:text-brand-accent" />
+                      <div className="min-w-0">
+                        <p className="font-medium text-gray-100 group-hover:text-brand-accent group-hover:underline inline-flex items-center gap-1.5">
+                          <span className="truncate">{doc.title}</span>
+                          <ExternalLink className="w-3 h-3 opacity-0 group-hover:opacity-70 flex-shrink-0" />
+                        </p>
+                        <p className="text-xs text-gray-400 group-hover:text-brand-accent/80 truncate">
+                          {doc.original_filename}
+                        </p>
                       </div>
-                    </div>
+                    </button>
                   </td>
                   <td className="px-4 py-3 text-gray-100">{doc.category_name}</td>
                   <td className="px-4 py-3">

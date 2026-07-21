@@ -54,7 +54,7 @@ export default function AdminQuestions() {
                     {q.is_answered ? 'Yes' : 'No'}
                   </span>
                 </td>
-                <td className="px-4 py-3 text-white/50 text-xs">
+                <td className="px-4 py-3 text-white text-xs">
                   {q.created_at ? new Date(q.created_at).toLocaleString() : '—'}
                 </td>
               </tr>
