@@ -46,9 +46,11 @@ class LLMService {
             fn($c) => !DocumentParser::isTableOfContentsChunk($c['content'] ?? '')
         ));
 
-        // Re-index 0..N so [SOURCE N] tags align with the filtered list.
+        // Prefer empty context over feeding TOC/index pages to the LLM.
+        // If detection wiped everything, keep original chunks so answers/sources still work.
         if (empty($substantive)) {
-            $substantive = $chunks; // last resort if everything was filtered
+            Logger::info('[llm] TOC filter removed all chunks — using original retrieval set');
+            $substantive = $chunks;
         }
 
         $context = $this->buildContext($substantive);
@@ -81,11 +83,16 @@ You are a knowledge assistant for Nautilus Shipping. Answer questions using ONLY
 
 Return STRICT JSON only with exactly these fields:
 {
-  "answer": "short answer",
+  "answer": "clear answer with enough detail to be useful",
   "usedSources": [0, 2]
 }
 
 Rules:
+- Write 3–6 complete sentences (or a short structured summary) that fully answer the question.
+- Include key requirements, steps, responsibilities, referenced procedures, and codes (e.g. SFT 04) when they appear in the excerpts.
+- Prefer a fuller reply over a one-line summary; stay focused on the question.
+- Format with line breaks when helpful: section title on its own line, blank line, explanation paragraph, then each list item (a/b/c) on its own line. Do not collapse structured content into one paragraph.
+- When the excerpts only reference another manual/procedure, say clearly what this document requires and which procedure to follow — do not invent steps that are not present.
 - Use the SOURCE IDs from the document excerpts below.
 - If the answer is based on the documents, include at least one source ID in usedSources.
 - If multiple sources contributed, include all relevant source IDs.
@@ -270,6 +277,9 @@ PROMPT;
             }
 
             $chunk = $chunks[$id];
+            if (DocumentParser::isTableOfContentsChunk($chunk['content'] ?? '')) {
+                continue;
+            }
             $key = $id . ':' . ($chunk['document_id'] ?? '') . ':' . ($chunk['page_number'] ?? '');
             if (isset($seen[$key])) {
                 continue;

@@ -9,7 +9,16 @@ const pdfPagesCache = new Map<number, string[]>();
 
 function isHeadingStyleQuestion(question: string): boolean {
   const q = question.trim();
-  return q.length > 0 && q.length < 100 && !q.endsWith('?');
+  if (!q || q.length >= 100 || q.endsWith('?')) return false;
+  // "what is hot work…" is a real question even without "?".
+  if (
+    /^(what|why|how|when|where|who|whom|which|whose|is|are|do|does|did|can|could|should|would|will|may|might|please|tell|explain|describe|define)\b/i.test(
+      q
+    )
+  ) {
+    return false;
+  }
+  return true;
 }
 
 function sourceFromHit(hit: AnswerHit): SourceLike {
@@ -146,16 +155,30 @@ function looksLikeTocPage(content: string): boolean {
   const lower = content.toLowerCase();
   if (lower.includes('table of contents')) return true;
 
+  // "Contents" as a heading plus dotted leaders — not the word "contents" in body prose.
+  const firstLines = content.split('\n').slice(0, 8).join(' ').toLowerCase();
+  if (/\b(table of )?contents\b/.test(firstLines) && (content.match(/\.{4,}/g) || []).length >= 3) {
+    return true;
+  }
+
   const lines = content.split('\n').map((l) => l.trim()).filter(Boolean);
   if (lines.length < 4) return false;
 
   let tocLines = 0;
   for (const line of lines) {
-    if (/\.{3,}\s*\d+\s*$/.test(line) || /\s{3,}\d{1,4}\s*$/.test(line)) {
+    // Require dotted leaders (classic TOC), not bare trailing numbers (common in body text).
+    if (/\.{3,}\s*\d{1,4}\s*$/.test(line)) {
       tocLines++;
     }
   }
-  return tocLines / lines.length >= 0.35;
+  return tocLines / lines.length >= 0.4;
+}
+
+/** Only treat short citation excerpts as TOC — never the full chunk `text` field. */
+function sourceLooksLikeToc(source: SourceLike): boolean {
+  const excerpt = String(source.excerpt ?? source.snippet ?? '').trim();
+  if (excerpt.length < 20 || excerpt.length > 500) return false;
+  return looksLikeTocPage(excerpt);
 }
 
 function isIndexEntryForQuestion(pageText: string, question: string): boolean {
@@ -178,13 +201,15 @@ async function locateSourcesFromChunks(
   auth: string,
   question: string,
   answer: string,
-  documentId?: number
+  documentId?: number,
+  categoryId?: number
 ): Promise<SourceLike[] | null> {
   if (!auth || !question.trim()) return null;
 
   const params = new URLSearchParams({ q: question });
   if (answer.trim()) params.set('answer', answer.slice(0, 800));
   if (documentId && documentId > 0) params.set('document_id', String(documentId));
+  if (categoryId && categoryId > 0) params.set('category_id', String(categoryId));
 
   try {
     const res = await fetch(`${API_BACKEND_URL}/chat/locate-source?${params}`, {
@@ -245,7 +270,7 @@ async function locateAnswerPageInDocument(
 }
 
 function buildPageLabel(physicalPage: number): string {
-  return `Page ${physicalPage}`;
+  return `page ${physicalPage}`;
 }
 
 /** Re-scan cited PDFs and fix page numbers using answer + question overlap. */
@@ -312,11 +337,12 @@ export async function locateSourcesForQuestion(
   auth: string,
   question: string,
   answer: string,
-  documentId?: number
+  documentId?: number,
+  categoryId?: number
 ): Promise<SourceLike[]> {
   if (!auth || !question.trim()) return [];
 
-  const hits = await findTopAnswerHits(auth, question, documentId);
+  const hits = await findTopAnswerHits(auth, question, documentId, categoryId);
   if (hits.length === 0) return [];
 
   // Heading-style queries: only cite when we found the real section page.
@@ -341,9 +367,10 @@ async function finalizeVerifiedSources(
   auth: string,
   question: string,
   answer: string,
-  sources: SourceLike[]
+  sources: SourceLike[],
+  categoryId?: number
 ): Promise<SourceLike[]> {
-  const located = await locateSourcesForQuestion(auth, question, answer);
+  const located = await locateSourcesForQuestion(auth, question, answer, undefined, categoryId);
   if (located.length > 0) {
     return finalizeSourceLinks(auth, located);
   }
@@ -396,13 +423,19 @@ export async function resolveAssistantTurn(
   question: string,
   answer: string,
   isAnswered: boolean,
-  rawSources: SourceLike[] | null | undefined
+  rawSources: SourceLike[] | null | undefined,
+  categoryId?: number
 ): Promise<{ answer: string; is_answered: boolean; sources: SourceLike[] }> {
   if (!auth || !question.trim()) {
     return { answer, is_answered: isAnswered, sources: [] };
   }
 
-  const hits = await findTopAnswerHits(auth, question);
+  const scopedCategoryId = categoryId && categoryId > 0 ? categoryId : undefined;
+  const allowedDocIds = scopedCategoryId
+    ? new Set((await listReadyPdfDocuments(auth, scopedCategoryId)).map((d) => d.id))
+    : null;
+
+  const hits = await findTopAnswerHits(auth, question, undefined, scopedCategoryId);
   const hit = hits[0] ?? null;
   const needsBetterAnswer =
     !isAnswered || isNotFoundAnswer(answer) || looksLikeRawDump(answer);
@@ -431,21 +464,46 @@ export async function resolveAssistantTurn(
       text: h.pageText,
     }));
     const synthesized = await synthesizeAnswerFromPassages(question, llmPassages);
-    const extracted = buildConciseAnswer(hit!.sentence);
+    const extracted = buildDetailedAnswer(hit!.pageText, question, hit!.sentence);
+    // Prefer LLM when available; otherwise use the full relevant PDF passage.
     const candidate = synthesized || extracted;
 
     if (candidate && candidate.length >= 15 && !isNotFoundAnswer(candidate)) {
-      finalAnswer = candidate;
+      // Keep a longer extractive passage when the model is overly brief.
+      if (
+        synthesized &&
+        extracted &&
+        synthesized.length < 220 &&
+        extracted.length > synthesized.length * 1.6 &&
+        phraseMatchScore(extracted, question) >= phraseMatchScore(synthesized, question)
+      ) {
+        finalAnswer = extracted;
+      } else {
+        finalAnswer = candidate;
+      }
       finalAnswered = true;
     }
   }
 
   // PDF hit with no API answer — still answer from the matched passage.
   if (!finalAnswered && hit && hit.score >= MIN_HIT_SCORE) {
-    const extracted = buildConciseAnswer(hit.sentence);
+    const extracted = buildDetailedAnswer(hit.pageText, question, hit.sentence);
     if (extracted && extracted.length >= 15) {
       finalAnswer = extracted;
       finalAnswered = true;
+    }
+  }
+
+  // API answer exists but is too short — expand with the relevant PDF section.
+  if (
+    finalAnswered &&
+    hit &&
+    finalAnswer.trim().length < 280 &&
+    phraseMatchScore(hit.pageText, question) >= 0.45
+  ) {
+    const extracted = buildDetailedAnswer(hit.pageText, question, hit.sentence);
+    if (extracted.length > finalAnswer.trim().length * 1.4) {
+      finalAnswer = extracted;
     }
   }
 
@@ -456,11 +514,12 @@ export async function resolveAssistantTurn(
   let sources: SourceLike[] = [];
 
   if (hits.length > 0) {
-    const grounded = hits.filter(
-      (h) =>
-        h.score >= MIN_HIT_SCORE &&
-        (!isHeadingStyleQuestion(question) || h.headingScore >= 0.65)
-    );
+    const scored = hits.filter((h) => h.score >= MIN_HIT_SCORE);
+    // Heading gate only for true section-title queries; never drop all hits.
+    const headingStrict = isHeadingStyleQuestion(question)
+      ? scored.filter((h) => h.headingScore >= 0.65)
+      : scored;
+    const grounded = headingStrict.length > 0 ? headingStrict : scored;
     if (grounded.length > 0) {
       sources = finalizeSourceLinks(
         auth,
@@ -473,7 +532,13 @@ export async function resolveAssistantTurn(
   }
 
   if (!sources.length) {
-    const chunkSources = await locateSourcesFromChunks(auth, question, finalAnswer);
+    const chunkSources = await locateSourcesFromChunks(
+      auth,
+      question,
+      finalAnswer,
+      undefined,
+      scopedCategoryId
+    );
     if (chunkSources?.length) {
       sources = finalizeSourceLinks(auth, dedupeSources(chunkSources));
     }
@@ -481,12 +546,15 @@ export async function resolveAssistantTurn(
 
   if (!sources.length) {
     const fallback = Array.isArray(rawSources) ? dedupeSources(rawSources) : [];
-    sources = await finalizeVerifiedSources(auth, question, finalAnswer, fallback);
+    sources = await finalizeVerifiedSources(auth, question, finalAnswer, fallback, scopedCategoryId);
   }
 
-  if (!sources.length && Array.isArray(rawSources) && rawSources.length > 0) {
-    sources = finalizeSourceLinks(auth, dedupeSources(rawSources));
+  // Always merge upstream API citations with locally grounded sources.
+  if (Array.isArray(rawSources) && rawSources.length > 0) {
+    sources = mergeAssistantSources(auth, sources, rawSources);
   }
+
+  sources = filterSourcesByCategory(sources, scopedCategoryId, allowedDocIds);
 
   return {
     answer: finalAnswer,
@@ -553,6 +621,67 @@ function normalizeToken(token: string): string {
   return t;
 }
 
+/** Max typo edits tolerated for a word of this length. */
+function fuzzyMaxEdits(len: number): number {
+  if (len >= 8) return 2;
+  if (len >= 4) return 1;
+  return 0;
+}
+
+/**
+ * Damerau-Levenshtein distance capped at `max` (returns max+1 when exceeded).
+ * Handles the common typo classes: substitution, insertion, deletion, transposition.
+ */
+function editDistanceAtMost(a: string, b: string, max: number): number {
+  if (a === b) return 0;
+  const la = a.length;
+  const lb = b.length;
+  if (Math.abs(la - lb) > max) return max + 1;
+
+  let prevPrev: number[] = [];
+  let prev = Array.from({ length: lb + 1 }, (_, j) => j);
+
+  for (let i = 1; i <= la; i++) {
+    const curr = [i];
+    let rowMin = i;
+    for (let j = 1; j <= lb; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      let val = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
+        val = Math.min(val, prevPrev[j - 2] + 1);
+      }
+      curr.push(val);
+      if (val < rowMin) rowMin = val;
+    }
+    if (rowMin > max) return max + 1;
+    prevPrev = prev;
+    prev = curr;
+  }
+  return prev[lb];
+}
+
+/** True when two normalized tokens match exactly or within typo distance. */
+function tokensFuzzyEqual(a: string, b: string): boolean {
+  if (a === b) return true;
+  const minLen = Math.min(a.length, b.length);
+  const max = fuzzyMaxEdits(minLen);
+  if (max === 0) return false;
+  // Short words: first letter must match (standard typo heuristic, cuts false positives).
+  if (minLen < 6 && a[0] !== b[0]) return false;
+  return editDistanceAtMost(a, b, max) <= max;
+}
+
+/** Set membership with typo tolerance ("proceduer" matches "procedure"). */
+function setHasFuzzy(tokens: Set<string>, token: string): boolean {
+  if (tokens.has(token)) return true;
+  if (fuzzyMaxEdits(token.length) === 0) return false;
+  let found = false;
+  tokens.forEach((candidate) => {
+    if (!found && tokensFuzzyEqual(token, candidate)) found = true;
+  });
+  return found;
+}
+
 function significantTokens(text: string): string[] {
   return Array.from(
     new Set(
@@ -601,7 +730,7 @@ function textHasNormalizedToken(haystack: string, token: string): boolean {
   const lower = haystack.toLowerCase();
   if (lower.includes(token)) return true;
   const hayTokens = new Set(significantTokens(haystack));
-  return hayTokens.has(normalizeToken(token));
+  return setHasFuzzy(hayTokens, normalizeToken(token));
 }
 
 function phraseMatchScore(text: string, question: string): number {
@@ -627,6 +756,9 @@ function phraseMatchScore(text: string, question: string): number {
       if (idxs.every((i) => i >= 0)) {
         const span = Math.max(...idxs) - Math.min(...idxs);
         if (span <= 40) best = Math.max(best, 0.7);
+      } else {
+        // Words only matched fuzzily (typos) — still credit topic presence.
+        best = Math.max(best, 0.6);
       }
     }
   }
@@ -649,14 +781,14 @@ function scorePageAgainstAnswer(pageText: string, answerTokens: string[], answer
 
   let hits = 0;
   for (const token of answerTokens) {
-    if (pageTokens.has(normalizeToken(token)) || pageLower.includes(token)) hits++;
+    if (setHasFuzzy(pageTokens, normalizeToken(token)) || pageLower.includes(token)) hits++;
   }
   const tokenScore = answerTokens.length > 0 ? hits / answerTokens.length : 0;
 
   const questionTokens = significantTokens(question);
   let questionHits = 0;
   for (const token of questionTokens) {
-    if (pageTokens.has(token) || pageLower.includes(token)) questionHits++;
+    if (setHasFuzzy(pageTokens, token) || pageLower.includes(token)) questionHits++;
   }
   const questionScore = questionTokens.length > 0 ? questionHits / questionTokens.length : 0;
 
@@ -687,36 +819,97 @@ type ReadyPdfDoc = {
   id: number;
   title: string;
   original_filename?: string;
+  category_id?: number;
+  category_name?: string;
 };
 
-async function listReadyPdfDocuments(auth: string): Promise<ReadyPdfDoc[]> {
-  try {
-    const res = await fetch(`${API_BACKEND_URL}/admin/documents?per_page=50&status=ready`, {
-      headers: { Authorization: auth },
-      cache: 'no-store',
-    });
-    if (!res.ok) return [];
+function filterSourcesByCategory(
+  sources: SourceLike[],
+  categoryId?: number,
+  allowedDocIds?: Set<number> | null
+): SourceLike[] {
+  if (!categoryId || sources.length === 0) return sources;
 
-    const json = await res.json();
-    const docs: Array<Record<string, unknown>> = Array.isArray(json?.data) ? json.data : [];
+  const filtered = sources.filter((src) => {
+    const srcCategory = Number(src.category_id ?? src.categoryId ?? 0);
+    if (srcCategory === categoryId) return true;
+    const fileId = getFileId(src);
+    if (fileId > 0 && allowedDocIds && allowedDocIds.size > 0) {
+      return allowedDocIds.has(fileId);
+    }
+    // When we cannot verify membership, keep sources without category metadata.
+    return srcCategory === 0;
+  });
 
-    return docs
-      .map((doc) => ({
-        id: Number(doc.id),
-        title: String(doc.title || doc.original_filename || 'Document'),
-        original_filename: doc.original_filename ? String(doc.original_filename) : undefined,
-        mime: String(doc.mime_type || ''),
-        name: String(doc.original_filename || '').toLowerCase(),
-      }))
-      .filter(
-        (doc) =>
-          doc.id > 0 &&
-          (doc.mime === 'application/pdf' || doc.name.endsWith('.pdf'))
-      )
-      .map(({ id, title, original_filename }) => ({ id, title, original_filename }));
-  } catch {
-    return [];
+  // Never drop every source because the category doc list could not be loaded.
+  if (filtered.length === 0 && (!allowedDocIds || allowedDocIds.size === 0)) {
+    return sources;
   }
+
+  return filtered;
+}
+
+/** Merge resolved + upstream API sources and attach PDF deep links. */
+export function mergeAssistantSources(
+  auth: string,
+  resolved: SourceLike[],
+  raw: SourceLike[]
+): SourceLike[] {
+  const merged = dedupeSources([...resolved, ...raw]);
+  return merged.length > 0 ? finalizeSourceLinks(auth, merged) : [];
+}
+
+async function listReadyPdfDocuments(auth: string, categoryId?: number): Promise<ReadyPdfDoc[]> {
+  const params = new URLSearchParams({ status: 'ready' });
+  if (categoryId && categoryId > 0) {
+    params.set('category_id', String(categoryId));
+  }
+
+  const endpoints = [
+    `${API_BACKEND_URL}/chat/documents?${params}`,
+    `${API_BACKEND_URL}/admin/documents?per_page=100&${params}`,
+  ];
+
+  for (const url of endpoints) {
+    try {
+      const res = await fetch(url, {
+        headers: { Authorization: auth },
+        cache: 'no-store',
+      });
+      if (!res.ok) continue;
+
+      const json = await res.json();
+      const docs: Array<Record<string, unknown>> = Array.isArray(json?.data) ? json.data : [];
+      const mapped = docs
+        .map((doc) => ({
+          id: Number(doc.id),
+          title: String(doc.title || doc.original_filename || 'Document'),
+          original_filename: doc.original_filename ? String(doc.original_filename) : undefined,
+          category_id: doc.category_id != null ? Number(doc.category_id) : undefined,
+          category_name: doc.category_name ? String(doc.category_name) : undefined,
+          mime: String(doc.mime_type || ''),
+          name: String(doc.original_filename || '').toLowerCase(),
+        }))
+        .filter(
+          (doc) =>
+            doc.id > 0 &&
+            (doc.mime === 'application/pdf' || doc.name.endsWith('.pdf'))
+        )
+        .map(({ id, title, original_filename, category_id, category_name }) => ({
+          id,
+          title,
+          original_filename,
+          category_id,
+          category_name,
+        }));
+
+      if (mapped.length > 0) return mapped;
+    } catch {
+      // try next endpoint
+    }
+  }
+
+  return [];
 }
 
 function isBoilerplateLine(line: string): boolean {
@@ -797,34 +990,203 @@ function scoreSentence(sentence: string, question: string): number {
   return score;
 }
 
-/** Turn the best matching sentence into a short chat reply. */
-function buildConciseAnswer(sentence: string): string {
-  let text = sentence
-    .replace(/^[\d•\-\s]+/, '')
-    .replace(/\s+/g, ' ')
-    .trim();
+/** Soft length target for extractive chat replies (characters). */
+const DETAILED_ANSWER_MAX = 1400;
 
-  // Keep only the first sentence if multiple were joined
-  const firstEnd = text.search(/[.!?](?:\s|$)/);
-  if (firstEnd > 80) {
-    text = text.slice(0, firstEnd + 1);
+/**
+ * Build a detailed, question-relevant reply from a PDF page.
+ * Expands around the best match to include the section heading,
+ * surrounding sentences, and following list items (a), b), …).
+ */
+function buildDetailedAnswer(
+  pageText: string,
+  question: string,
+  bestSentence?: string
+): string {
+  const stripped = stripBoilerplate(pageText).replace(/\s+/g, ' ').trim();
+  if (!stripped) return '';
+
+  const units = splitPassageUnits(stripped);
+  if (units.length === 0) {
+    return truncateAtWord(stripped, DETAILED_ANSWER_MAX);
   }
 
-  if (text.length > 280) {
-    const cut = text.slice(0, 277);
-    const lastSpace = cut.lastIndexOf(' ');
-    text = `${(lastSpace > 120 ? cut.slice(0, lastSpace) : cut).trimEnd()}…`;
+  let bestIdx = 0;
+  let bestScore = -1;
+  for (let i = 0; i < units.length; i++) {
+    let score = scoreSentence(units[i], question);
+    if (
+      bestSentence &&
+      units[i].toLowerCase().includes(bestSentence.toLowerCase().slice(0, 60))
+    ) {
+      score += 0.5;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      bestIdx = i;
+    }
   }
 
-  if (text && !/[.!?]$/.test(text)) text += '.';
+  // Walk back to a nearby section heading / lettered item when present.
+  let start = bestIdx;
+  for (let i = bestIdx; i >= Math.max(0, bestIdx - 4); i--) {
+    if (looksLikeSectionHeading(units[i])) {
+      start = i;
+      break;
+    }
+    // Include one lead-in sentence before the match when it is short.
+    if (i === bestIdx - 1 && units[i].length < 220) start = i;
+  }
+
+  const parts: string[] = [];
+  let length = 0;
+  for (let i = start; i < units.length; i++) {
+    const unit = units[i].trim();
+    if (!unit) continue;
+
+    // Stop at the next major section after we already have useful content.
+    if (i > bestIdx && parts.length >= 2 && looksLikeSectionHeading(unit)) {
+      break;
+    }
+
+    const nextLen = length + unit.length + (parts.length ? 1 : 0);
+    if (parts.length > 0 && nextLen > DETAILED_ANSWER_MAX) break;
+
+    parts.push(unit);
+    length = nextLen;
+
+    // Prefer stopping after list items that follow the matched point.
+    if (
+      i > bestIdx &&
+      length >= 450 &&
+      isLetteredListItem(unit) &&
+      i + 1 < units.length &&
+      !isLetteredListItem(units[i + 1])
+    ) {
+      break;
+    }
+  }
+
+  let text = formatAnswerBlocks(parts);
+  if (!text && bestSentence) {
+    text = formatAnswerBlocks([bestSentence.replace(/\s+/g, ' ').trim()]);
+  }
+  text = truncateAtWord(text, DETAILED_ANSWER_MAX);
+  if (text && !/[.!?…]$/.test(text.trim())) text += '.';
   return text;
 }
 
-function splitSentences(text: string): string[] {
-  return stripBoilerplate(text)
-    .split(/[.!?]+/)
+/** Join answer units with readable line breaks (heading / paragraph / list items). */
+function formatAnswerBlocks(parts: string[]): string {
+  const cleaned = parts.map((p) => p.replace(/\s+/g, ' ').trim()).filter(Boolean);
+  if (cleaned.length === 0) return '';
+  if (cleaned.length === 1) return cleaned[0];
+
+  const lines: string[] = [];
+  for (let i = 0; i < cleaned.length; i++) {
+    const unit = cleaned[i];
+    const prev = lines.length > 0 ? cleaned[i - 1] : '';
+
+    if (looksLikeSectionHeading(unit)) {
+      if (lines.length > 0) lines.push('');
+      lines.push(unit);
+      continue;
+    }
+
+    if (isLetteredListItem(unit) || /^[a-z]\)\s+/i.test(unit)) {
+      // Blank line before the first list item after a paragraph.
+      if (lines.length > 0 && prev && !isLetteredListItem(prev) && !/^[a-z]\)\s+/i.test(prev)) {
+        lines.push('');
+      }
+      lines.push(unit);
+      continue;
+    }
+
+    // Prose paragraph — separate from previous block when needed.
+    if (
+      lines.length > 0 &&
+      (looksLikeSectionHeading(prev) || isLetteredListItem(prev) || /^[a-z]\)\s+/i.test(prev))
+    ) {
+      lines.push('');
+    } else if (lines.length > 0 && prev && prev.length > 120) {
+      lines.push('');
+    }
+    lines.push(unit);
+  }
+
+  return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+/** @deprecated Prefer buildDetailedAnswer — kept for callers that only have one sentence. */
+function buildConciseAnswer(sentence: string): string {
+  return buildDetailedAnswer(sentence, '', sentence);
+}
+
+function looksLikeSectionHeading(text: string): boolean {
+  const t = text.trim();
+  if (t.length < 8 || t.length > 160) return false;
+  // "m) Responsibility During Repairs and Overhauls" — title, not a list body.
+  if (
+    /^[a-z]\)\s+\S+/i.test(t) &&
+    !/[.!?]$/.test(t) &&
+    !/(See\s+|–|—)/i.test(t) &&
+    t.length < 120
+  ) {
+    return true;
+  }
+  if (/^\d+(\.\d+)*\s+[A-Z]/.test(t) && t.length < 120) return true;
+  // Title-case heading without sentence punctuation
+  const words = t.split(/\s+/);
+  if (words.length >= 3 && words.length <= 14 && !/[.!?]$/.test(t) && !/^[a-z]\)/i.test(t)) {
+    const caps = words.filter((w) => /^[A-Z]/.test(w)).length;
+    if (caps / words.length >= 0.6) return true;
+  }
+  return false;
+}
+
+function isLetteredListItem(text: string): boolean {
+  const t = text.trim();
+  if (!/^[a-z]\)\s+/i.test(t)) return false;
+  // Body items usually reference a procedure or end as a full clause.
+  return /(See\s+|–|—)/i.test(t) || /[.!?]$/.test(t) || t.length >= 80;
+}
+
+function truncateAtWord(text: string, max: number): string {
+  if (text.length <= max) return text;
+  // Prefer cutting at a paragraph/line boundary when close to the limit.
+  const window = text.slice(0, max);
+  const paraBreak = Math.max(window.lastIndexOf('\n\n'), window.lastIndexOf('\n'));
+  if (paraBreak > max * 0.55) {
+    return window.slice(0, paraBreak).trimEnd();
+  }
+  const cut = text.slice(0, max - 1);
+  const lastSpace = cut.lastIndexOf(' ');
+  return `${(lastSpace > max * 0.5 ? cut.slice(0, lastSpace) : cut).trimEnd()}…`;
+}
+
+/**
+ * Split page text into sentences and list/heading units so lettered items
+ * like "a) Hotwork – …" stay intact for detailed answers.
+ */
+function splitPassageUnits(text: string): string[] {
+  const normalized = stripBoilerplate(text)
+    .replace(/\r/g, '')
+    .replace(/\n+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!normalized) return [];
+
+  // Keep lettered / numbered list markers as unit boundaries.
+  const rough = normalized
+    .split(/(?=\b[a-z]\)\s+)|(?=\b\d+\.\s+[A-Z])|(?<=[.!?])\s+(?=[A-Z(\[\d])/)
     .map((s) => s.trim())
-    .filter((s) => s.length >= 25);
+    .filter((s) => s.length >= 12);
+
+  return rough.length > 0 ? rough : [normalized];
+}
+
+function splitSentences(text: string): string[] {
+  return splitPassageUnits(text).filter((s) => s.length >= 25);
 }
 
 type AnswerHit = {
@@ -865,9 +1227,10 @@ function considerHit(hits: AnswerHit[], candidate: AnswerHit): void {
 async function findTopAnswerHits(
   auth: string,
   question: string,
-  onlyDocumentId?: number
+  onlyDocumentId?: number,
+  categoryId?: number
 ): Promise<AnswerHit[]> {
-  const docs = await listReadyPdfDocuments(auth);
+  const docs = await listReadyPdfDocuments(auth, categoryId);
   if (docs.length === 0) return [];
 
   const tokens = significantTokens(question);
@@ -917,7 +1280,7 @@ async function findTopAnswerHits(
         physicalPage,
         printedPage: extractPrintedPageNumber(content),
         sentence,
-        pageText: stripped.slice(0, 2200),
+        pageText: stripped.slice(0, 4000),
         score,
         headingScore,
       });
@@ -977,13 +1340,7 @@ async function findBestAnswerHit(
 }
 
 function extractAnswerSentences(pageText: string, question: string): string {
-  const ranked = splitSentences(pageText)
-    .map((sentence) => ({ sentence, score: scoreSentence(sentence, question) }))
-    .sort((a, b) => b.score - a.score);
-
-  const top = ranked[0]?.sentence;
-  if (!top) return '';
-  return buildConciseAnswer(top);
+  return buildDetailedAnswer(pageText, question);
 }
 
 /**
@@ -992,11 +1349,13 @@ function extractAnswerSentences(pageText: string, question: string): string {
  */
 export async function recoverAnswerFromDocuments(
   auth: string,
-  question: string
+  question: string,
+  categoryId?: number
 ): Promise<{ answer: string; sources: SourceLike[] } | null> {
   if (!auth || !question.trim()) return null;
 
-  const hits = await findTopAnswerHits(auth, question);
+  const scopedCategoryId = categoryId && categoryId > 0 ? categoryId : undefined;
+  const hits = await findTopAnswerHits(auth, question, undefined, scopedCategoryId);
   const hit = hits[0];
   if (!hit || hit.score < MIN_HIT_SCORE) return null;
 
@@ -1008,9 +1367,19 @@ export async function recoverAnswerFromDocuments(
 
   let answer =
     (await synthesizeAnswerFromPassages(question, llmPassages)) ||
-    buildConciseAnswer(hit.sentence);
+    buildDetailedAnswer(hit.pageText, question, hit.sentence);
 
   if (!answer || answer.length < 20 || /could not find/i.test(answer)) return null;
+
+  // Prefer a fuller PDF passage when synthesis is too brief.
+  const extracted = buildDetailedAnswer(hit.pageText, question, hit.sentence);
+  if (
+    extracted.length > answer.length * 1.5 &&
+    answer.length < 220 &&
+    phraseMatchScore(extracted, question) >= 0.45
+  ) {
+    answer = extracted;
+  }
 
   return {
     answer,

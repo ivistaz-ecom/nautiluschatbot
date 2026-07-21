@@ -170,7 +170,13 @@ class DocumentController {
 
     /** Stream a document file for admins (any status — used for re-parse in Node BFF). */
     public function serveAdminFile(array $params): void {
-        AuthMiddleware::requireAdmin();
+        // Accept Bearer or ?token= so the admin UI can open PDFs in a new tab.
+        $jwt = Request::bearerToken() ?? Request::get('token');
+        $user = AuthMiddleware::requireToken(is_string($jwt) ? $jwt : null);
+        if (($user['role'] ?? '') !== 'admin') {
+            Response::error('Forbidden: admin only', 403);
+            return;
+        }
         $this->streamDocumentFile((int) ($params['id'] ?? 0), false);
     }
 

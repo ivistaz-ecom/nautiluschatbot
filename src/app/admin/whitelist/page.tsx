@@ -76,18 +76,18 @@ export default function AdminWhitelist() {
             {entries.map(e => (
               <tr key={e.id} className="hover:bg-white/5">
                 <td className="px-4 py-3 font-mono text-xs text-white">{e.origin}</td>
-                <td className="px-4 py-3 text-white/70 text-xs">{e.note || '—'}</td>
+                <td className="px-4 py-3 text-white text-xs">{e.note || '—'}</td>
                 <td className="px-4 py-3">
-                  <span className={`text-xs px-2 py-0.5 rounded-full ${e.is_active ? 'bg-green-500/20 text-green-300' : 'bg-white/10 text-white/50'}`}>
+                  <span className={`text-xs px-2 py-0.5 rounded-full ${e.is_active ? 'bg-green-500/20 text-green-300' : 'bg-white/10 text-white'}`}>
                     {e.is_active ? 'Active' : 'Inactive'}
                   </span>
                 </td>
                 <td className="px-4 py-3">
                   <div className="flex items-center gap-1">
-                    <button onClick={() => handleToggle(e.id)} className="p-1.5 text-white/40 hover:text-blue-400 rounded" title="Toggle">
+                    <button onClick={() => handleToggle(e.id)} className="p-1.5 text-white hover:text-blue-400 rounded" title="Toggle">
                       {e.is_active ? <ToggleRight className="w-4 h-4" /> : <ToggleLeft className="w-4 h-4" />}
                     </button>
-                    <button onClick={() => handleDelete(e.id)} className="p-1.5 text-white/40 hover:text-red-400 rounded">
+                    <button onClick={() => handleDelete(e.id)} className="p-1.5 text-white hover:text-red-400 rounded">
                       <Trash2 className="w-3.5 h-3.5" />
                     </button>
                   </div>

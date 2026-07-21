@@ -188,11 +188,11 @@ export function ChatWorkspace({ sessionId = null }: ChatWorkspaceProps) {
       const sid = normalizeSessionId(activeSession ?? session_id);
       const isNew = !activeSession;
 
-      const enrichedSources = is_answered && sources ? [...sources] : [];
-      if (is_answered) {
+      const enrichedSources = Array.isArray(sources) ? [...sources] : [];
+      if (is_answered || enrichedSources.length > 0) {
         cacheAssistantTurn(String(message_id), {
           answer,
-          is_answered: true,
+          is_answered: Boolean(is_answered) || enrichedSources.length > 0,
           sources: enrichedSources,
         });
       }
@@ -214,7 +214,7 @@ export function ChatWorkspace({ sessionId = null }: ChatWorkspaceProps) {
             role: 'assistant',
             answer,
             sources: enrichedSources,
-            is_answered: is_answered ? 1 : 0,
+            is_answered: is_answered || enrichedSources.length > 0 ? 1 : 0,
             created_at: new Date().toISOString(),
           } as ChatMessage,
         ];
@@ -559,7 +559,7 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
           <p className="text-white/90 leading-relaxed whitespace-pre-wrap">{msg.answer}</p>
         </div>
 
-        {msg.is_answered !== 0 && msg.sources && msg.sources.length > 0 && (
+        {msg.sources && msg.sources.length > 0 && (
           <div className="space-y-1.5">
             <p className="text-[11px] font-medium uppercase tracking-wide text-white/40">
               Sources
@@ -607,7 +607,7 @@ function SourceBadge({ source }: { source: MessageSource }) {
   const pageLabel = getSourcePageLabel(source);
   const token = typeof window !== 'undefined' ? localStorage.getItem('nk_token') : null;
   const href = token ? buildSourcePdfUrl(source, token) : undefined;
-
+  const openLabel = pageLabel ? `Open PDF — ${pageLabel}` : 'Open PDF';
   const title = pageLabel ? `Open ${fileName} at ${pageLabel}` : `Open ${fileName}`;
 
   if (!href) {
@@ -618,11 +618,9 @@ function SourceBadge({ source }: { source: MessageSource }) {
       >
         <FileText className="w-3 h-3 flex-shrink-0" />
         <span className="font-medium truncate max-w-[200px]">{fileName}</span>
-        {pageLabel != null && (
-          <span className="flex-shrink-0 rounded-md bg-brand-accent/20 text-brand-accent border border-brand-accent/30 px-1.5 py-0.5 font-semibold tabular-nums">
-            {pageLabel}
-          </span>
-        )}
+        <span className="flex-shrink-0 rounded-md bg-brand-accent/20 text-brand-accent border border-brand-accent/30 px-1.5 py-0.5 font-semibold tabular-nums">
+          {openLabel}
+        </span>
       </span>
     );
   }
@@ -636,12 +634,10 @@ function SourceBadge({ source }: { source: MessageSource }) {
       className="inline-flex items-center gap-1.5 bg-white/10 text-white/80 text-xs rounded-lg px-2.5 py-1.5 border border-white/20 hover:bg-white/20 hover:border-white/30 transition-colors cursor-pointer max-w-full"
     >
       <FileText className="w-3 h-3 flex-shrink-0" />
-      <span className="font-medium truncate max-w-[200px]">{fileName}</span>
-      {pageLabel != null && (
-        <span className="flex-shrink-0 rounded-md bg-brand-accent/20 text-brand-accent border border-brand-accent/30 px-1.5 py-0.5 font-semibold tabular-nums">
-          {pageLabel}
-        </span>
-      )}
+      <span className="font-medium truncate max-w-[160px]">{fileName}</span>
+      <span className="flex-shrink-0 rounded-md bg-brand-accent/20 text-brand-accent border border-brand-accent/30 px-1.5 py-0.5 font-semibold tabular-nums whitespace-nowrap">
+        {openLabel}
+      </span>
     </a>
   );
 }

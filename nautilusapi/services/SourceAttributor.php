@@ -376,7 +376,10 @@ class SourceAttributor {
                 break;
             }
         }
-        $best ??= $ranked[0];
+        // Never cite a TOC/index page — better empty sources than a wrong #page= link.
+        if ($best === null) {
+            return [];
+        }
 
         $fileId     = (int) ($best['document_id'] ?? 0);
         $fileName   = $best['title'] ?? '';
@@ -431,6 +434,8 @@ class SourceAttributor {
             'page_number'    => $pageNumber,
             'relevance_rank' => $rank,
             'mime_type'      => $chunk['mime_type'] ?? 'application/pdf',
+            'category_id'    => isset($chunk['category_id']) ? (int) $chunk['category_id'] : null,
+            'category_name'  => $chunk['category_name'] ?? null,
             'fileId'         => $fileId,
             'fileName'       => $fileName,
             'pageNumber'     => $pageNumber,
@@ -438,7 +443,7 @@ class SourceAttributor {
         ];
 
         if ($pageNumber !== null) {
-            $source['page_label'] = "Page {$pageNumber}";
+            $source['page_label'] = "page {$pageNumber}";
             $source['pageLabel']  = $source['page_label'];
         }
 
@@ -470,15 +475,33 @@ class SourceAttributor {
         }
 
         foreach ($chunkLists as $list) {
-            if (!empty($list)) {
-                $raw = self::consolidateByDocument([self::chunkToSource($list[0])]);
-                Logger::info('[source-attribution] ensureNonEmptySources: used first chunk page='
-                    . ($list[0]['page_number'] ?? '?'));
-                return $raw;
+            if (empty($list)) {
+                continue;
             }
+            $nonToc = self::firstNonTocChunk($list);
+            if ($nonToc === null) {
+                continue;
+            }
+            $raw = self::consolidateByDocument([self::chunkToSource($nonToc)]);
+            Logger::info('[source-attribution] ensureNonEmptySources: used first non-TOC chunk page='
+                . ($nonToc['page_number'] ?? '?'));
+            return $raw;
         }
 
         return [];
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>> $chunks
+     * @return array<string, mixed>|null
+     */
+    public static function firstNonTocChunk(array $chunks): ?array {
+        foreach ($chunks as $chunk) {
+            if (!DocumentParser::isTableOfContentsChunk($chunk['content'] ?? '')) {
+                return $chunk;
+            }
+        }
+        return null;
     }
 
     /** @param int[] $pages */

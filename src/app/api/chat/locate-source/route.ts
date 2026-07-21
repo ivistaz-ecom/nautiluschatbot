@@ -13,6 +13,9 @@ export async function GET(req: NextRequest) {
   const question = req.nextUrl.searchParams.get('q') || req.nextUrl.searchParams.get('question') || '';
   const answer = req.nextUrl.searchParams.get('answer') || '';
   const documentId = req.nextUrl.searchParams.get('document_id');
+  const categoryIdParam = req.nextUrl.searchParams.get('category_id');
+  const categoryId =
+    categoryIdParam != null && Number(categoryIdParam) > 0 ? Number(categoryIdParam) : undefined;
 
   if (question.trim().length < 3) {
     return NextResponse.json({ success: false, message: 'Question too short' }, { status: 422 });
@@ -23,6 +26,7 @@ export async function GET(req: NextRequest) {
     const params = new URLSearchParams({ q: question });
     if (answer.trim()) params.set('answer', answer.slice(0, 800));
     if (documentId) params.set('document_id', documentId);
+    if (categoryId) params.set('category_id', String(categoryId));
 
     try {
       const upstream = await fetch(`${API_BACKEND_URL}/chat/locate-source?${params}`, {
@@ -44,7 +48,8 @@ export async function GET(req: NextRequest) {
     auth,
     question,
     answer,
-    documentId ? Number(documentId) : undefined
+    documentId ? Number(documentId) : undefined,
+    categoryId
   );
 
   return NextResponse.json({ success: true, data: { sources } });

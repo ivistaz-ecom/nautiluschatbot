@@ -224,6 +224,17 @@ class AdminController {
         Response::success(null, 'Query answered');
     }
 
+    public function queriesDelete(array $params = []): void {
+        $admin = AuthMiddleware::requireAdmin();
+        unset($admin);
+        $id = (int) ($params['id'] ?? 0);
+
+        $affected = Database::execute('DELETE FROM unanswered_queries WHERE id = ?', [$id]);
+        if (!$affected) { Response::error('Query not found', 404); return; }
+
+        Response::success(null, 'Query deleted');
+    }
+
     // ══ ALL QUESTIONS ════════════════════════════════════════════════
 
     public function allQuestions(array $params = []): void {

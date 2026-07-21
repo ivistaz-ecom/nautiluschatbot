@@ -265,6 +265,14 @@ export const api = {
         request<PaginatedResponse<UnansweredQuery>>('GET', `/admin/queries?status=${status}&page=${page}`),
       answer: (id: number, answer: string) =>
         request('POST', `/admin/queries/${id}/answer`, { answer }),
+      delete: async (id: number) => {
+        try {
+          return await request('DELETE', `/admin/queries/${id}`);
+        } catch {
+          // Fallback for servers that don't support DELETE routing
+          return request('POST', `/admin/queries/${id}/delete`);
+        }
+      },
     },
 
     questions: (params?: Record<string, string | number>) => {
@@ -385,15 +393,9 @@ export function getSourcePageLabel(source: MessageSource): string | undefined {
     const label = source.pageLabel ?? source.page_label;
     return label || undefined;
   }
-  if (pages.length === 1) return `Page ${pages[0]}`;
+  if (pages.length === 1) return `page ${pages[0]}`;
 
-  const sorted = [...pages].sort((a, b) => a - b);
-  const consecutive = sorted.every((page, index) => index === 0 || page === sorted[index - 1] + 1);
-  if (consecutive) {
-    return `Pages ${sorted[0]}–${sorted[sorted.length - 1]}`;
-  }
-
-  return `Pages ${sorted.join(', ')}`;
+  return `page ${pages[0]}–${pages[pages.length - 1]}`;
 }
 
 /** PDF excerpt shown under source badges for verification. */
@@ -490,6 +492,35 @@ export interface Document {
   error_message?: string;
   file_on_disk?: boolean;
   created_at: string;
+}
+
+/** Admin PDF/DOCX viewer URL. Ready docs use the chat file route (already supports ?token=). */
+export function buildAdminDocumentUrl(
+  documentId: number,
+  token: string,
+  status?: Document['status']
+): string {
+  const path =
+    status && status !== 'ready'
+      ? `/admin/documents/${documentId}/file`
+      : `/chat/documents/${documentId}/file`;
+  return `${DOCUMENT_API_URL}${path}?token=${encodeURIComponent(token)}`;
+}
+
+export function openAdminDocument(documentId: number, status?: Document['status']): void {
+  const token = getToken();
+  if (!token) {
+    throw new Error('Please log in again to view documents.');
+  }
+
+  const url = buildAdminDocumentUrl(documentId, token, status);
+  const link = document.createElement('a');
+  link.href = url;
+  link.target = '_blank';
+  link.rel = 'noopener noreferrer';
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
 }
 
 export type IndexingHealth = 'good' | 'low' | 'none' | 'not_ready';

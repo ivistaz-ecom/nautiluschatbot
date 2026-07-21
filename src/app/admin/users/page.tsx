@@ -32,7 +32,7 @@ export default function AdminUsers() {
     <div className="max-w-6xl mx-auto px-6 py-6">
       <div className="flex items-center gap-3 mb-6">
         <h1 className="text-xl font-bold text-white">Users</h1>
-        <span className="text-white/50 text-sm">{total} total</span>
+        <span className="text-white/80 text-sm">{total} total</span>
       </div>
 
       <div className="flex gap-3 mb-4">
@@ -77,7 +77,7 @@ export default function AdminUsers() {
                   </div>
                 </td>
                 <td className="px-4 py-3">
-                  <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${u.role === 'admin' ? 'bg-purple-500/20 text-purple-300' : 'bg-white/10 text-white/70'}`}>
+                  <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${u.role === 'admin' ? 'bg-purple-500/20 text-purple-300' : 'bg-white/10 text-white'}`}>
                     {u.role}
                   </span>
                 </td>
@@ -86,7 +86,7 @@ export default function AdminUsers() {
                     ? <span className="text-green-400 text-xs">Verified</span>
                     : <span className="text-amber-400 text-xs">Pending</span>}
                 </td>
-                <td className="px-4 py-3 text-xs text-white/50">
+                <td className="px-4 py-3 text-xs text-white">
                   {u.created_at ? new Date(u.created_at).toLocaleDateString() : '—'}
                 </td>
                 <td className="px-4 py-3">
@@ -96,7 +96,7 @@ export default function AdminUsers() {
                 </td>
                 <td className="px-4 py-3">
                   <button onClick={() => handleToggle(u.id)}
-                    className={`p-1.5 rounded transition-colors ${u.is_active ? 'text-white/40 hover:text-red-400 hover:bg-red-500/10' : 'text-white/40 hover:text-green-400 hover:bg-green-500/10'}`}
+                    className={`p-1.5 rounded transition-colors ${u.is_active ? 'text-white hover:text-red-400 hover:bg-red-500/10' : 'text-white hover:text-green-400 hover:bg-green-500/10'}`}
                     title={u.is_active ? 'Deactivate' : 'Activate'}>
                     {u.is_active ? <UserX className="w-4 h-4" /> : <UserCheck className="w-4 h-4" />}
                   </button>
