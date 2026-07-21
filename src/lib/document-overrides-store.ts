@@ -51,3 +51,10 @@ export function saveDocumentOverride(
   writeAll(all);
   return entry;
 }
+
+export function clearDocumentOverride(id: number): void {
+  const all = readAll();
+  if (!(String(id) in all)) return;
+  delete all[String(id)];
+  writeAll(all);
+}

@@ -39,9 +39,12 @@ class ChatController {
             return;
         }
 
-        $question   = trim(strip_tags(Request::post('question')));
-        $sessionId  = Request::post('session_id');
-        $categoryId = Request::post('category_id') ? (int) Request::post('category_id') : null;
+        $question     = trim(strip_tags(Request::post('question')));
+        $sessionId    = Request::post('session_id');
+        $categoryIds  = $this->parseCategoryIdsFromRequest(true);
+        $userScoped   = $categoryIds !== null && count($categoryIds) > 0;
+        // Single id kept for FAQ / message persistence columns.
+        $categoryId   = $categoryIds && count($categoryIds) === 1 ? $categoryIds[0] : null;
 
         // Create or validate session
         if ($sessionId) {
@@ -64,14 +67,23 @@ class ChatController {
         // ── Step 1: FAQ cache check ──────────────────────────────
         $normalised = $this->normaliseQuestion($question);
         $hash       = hash('sha256', $normalised);
-        $faq        = Database::queryOne(
-            'SELECT * FROM faqs WHERE question_hash = ?',
-            [$hash]
-        );
+        // When category filters are active, only reuse FAQs from those categories.
+        if ($categoryIds && count($categoryIds) > 0) {
+            $placeholders = implode(',', array_fill(0, count($categoryIds), '?'));
+            $faq = Database::queryOne(
+                "SELECT * FROM faqs WHERE question_hash = ? AND category_id IN ($placeholders)",
+                [$hash, ...$categoryIds]
+            );
+        } else {
+            $faq = Database::queryOne(
+                'SELECT * FROM faqs WHERE question_hash = ?',
+                [$hash]
+            );
+        }
 
         if ($faq && $faq['ask_count'] >= $cfg['faq']['cache_threshold'] && $faq['canonical_answer']) {
             // Cached answer — still attach PDF sources from retrieval so cards always render.
-            $retrieval = $this->retrieveChunks($question, $categoryId, $cfg['llm']['context_chunks']);
+            $retrieval = $this->retrieveChunks($question, $categoryIds, $cfg['llm']['context_chunks']);
             $cachedSources = SourceAttributor::ensureNonEmptySources(
                 [],
                 $retrieval['for_llm'] ?? [],
@@ -115,12 +127,17 @@ class ChatController {
         }
 
         // ── Step 2: Auto-detect category from keywords ───────────
-        if (!$categoryId) {
-            $categoryId = $this->detectCategory($question);
+        // Only when the user did not pick manuals; keep multi-select as-is.
+        if (!$categoryIds) {
+            $detected = $this->detectCategory($question);
+            if ($detected) {
+                $categoryIds = [$detected];
+                $categoryId  = $detected;
+            }
         }
 
         // ── Step 3: Retrieve relevant document chunks ─────────────
-        $retrieval = $this->retrieveChunks($question, $categoryId, $cfg['llm']['context_chunks']);
+        $retrieval = $this->retrieveChunks($question, $categoryIds, $cfg['llm']['context_chunks']);
         $chunks    = $retrieval['for_llm'];
         $allChunks = $retrieval['for_fallback'];
 
@@ -138,8 +155,12 @@ class ChatController {
         }
 
         if (empty($chunks)) {
-            // No documents found at all
-            $answer  = 'I could not find any relevant information in the knowledge base for your question.';
+            // No documents found at all (or none in the user-selected manuals).
+            $answer = $userScoped
+                ? (count($categoryIds) > 1
+                    ? 'The given question was not found in the selected categories.'
+                    : 'The given question was not found in the selected category.')
+                : 'I could not find any relevant information in the knowledge base for your question.';
             $msgId   = $this->persistMessage($sessionId, $user['id'], $question, $answer, $categoryId, 0, 0.0);
             $queryId = Database::insert(
                 'INSERT INTO unanswered_queries (message_id, user_id, question) VALUES (?, ?, ?)',
@@ -268,10 +289,10 @@ class ChatController {
         $user = AuthMiddleware::require();
         unset($user);
 
-        $question   = trim(strip_tags(Request::get('q') ?? Request::get('question') ?? ''));
-        $answer     = trim(strip_tags(Request::get('answer') ?? ''));
-        $documentId = Request::get('document_id') ? (int) Request::get('document_id') : null;
-        $categoryId = Request::get('category_id') ? (int) Request::get('category_id') : null;
+        $question    = trim(strip_tags(Request::get('q') ?? Request::get('question') ?? ''));
+        $answer      = trim(strip_tags(Request::get('answer') ?? ''));
+        $documentId  = Request::get('document_id') ? (int) Request::get('document_id') : null;
+        $categoryIds = $this->parseCategoryIdsFromRequest(false);
 
         if (mb_strlen($question) < 3) {
             Response::error('Question too short', 422);
@@ -279,7 +300,7 @@ class ChatController {
         }
 
         $cfg       = require __DIR__ . '/../../../config/config.php';
-        $retrieval = $this->retrieveChunks($question, $categoryId, 20);
+        $retrieval = $this->retrieveChunks($question, $categoryIds, 20);
         $chunks    = $retrieval['for_fallback'];
 
         $chunks = array_values(array_filter(
@@ -436,10 +457,31 @@ class ChatController {
 
     public function categories(array $params = []): void {
         AuthMiddleware::require();
+        // Only categories that currently have at least one ready PDF.
         $rows = Database::query(
-            'SELECT id, name, slug, description, parent_id, sort_order
-             FROM categories
-             ORDER BY sort_order ASC, name ASC'
+            "SELECT c.id, c.name, c.slug, c.description, c.parent_id, c.sort_order,
+                    (
+                      SELECT COUNT(*)
+                      FROM documents d
+                      WHERE d.category_id = c.id
+                        AND d.status = 'ready'
+                        AND (
+                          d.mime_type = 'application/pdf'
+                          OR LOWER(d.original_filename) LIKE '%.pdf'
+                        )
+                    ) AS doc_count
+             FROM categories c
+             WHERE EXISTS (
+               SELECT 1
+               FROM documents d
+               WHERE d.category_id = c.id
+                 AND d.status = 'ready'
+                 AND (
+                   d.mime_type = 'application/pdf'
+                   OR LOWER(d.original_filename) LIKE '%.pdf'
+                 )
+             )
+             ORDER BY c.sort_order ASC, c.name ASC"
         );
         Response::success($rows);
     }
@@ -450,15 +492,18 @@ class ChatController {
     public function documents(array $params = []): void {
         AuthMiddleware::require();
 
-        $categoryId = Request::get('category_id') ? (int) Request::get('category_id') : null;
-        $status     = Request::get('status') ?: 'ready';
+        $categoryIds = $this->parseCategoryIdsFromRequest(false);
+        $status      = Request::get('status') ?: 'ready';
 
         $where = ['d.category_id IS NOT NULL'];
         $binds = [];
 
-        if ($categoryId) {
-            $where[] = 'd.category_id = ?';
-            $binds[] = $categoryId;
+        if ($categoryIds && count($categoryIds) > 0) {
+            $placeholders = implode(',', array_fill(0, count($categoryIds), '?'));
+            $where[] = "d.category_id IN ($placeholders)";
+            foreach ($categoryIds as $id) {
+                $binds[] = $id;
+            }
         }
         if ($status !== '') {
             $where[] = 'd.status = ?';
@@ -600,31 +645,74 @@ class ChatController {
         return null;
     }
 
+
+    /**
+     * Parse selected category filter from request (multi-select).
+     * Accepts category_ids (array) and/or category_id (single, legacy).
+     * @return array<int>|null  null = no filter (all categories)
+     */
+    private function parseCategoryIdsFromRequest(bool $fromPost = true): ?array {
+        $raw = $fromPost ? Request::post('category_ids') : Request::get('category_ids');
+        $ids = [];
+        if (is_array($raw)) {
+            foreach ($raw as $v) {
+                $id = (int) $v;
+                if ($id > 0) $ids[] = $id;
+            }
+        } elseif (is_string($raw) && $raw !== '') {
+            foreach (explode(',', $raw) as $v) {
+                $id = (int) trim($v);
+                if ($id > 0) $ids[] = $id;
+            }
+        }
+
+        $single = $fromPost ? Request::post('category_id') : Request::get('category_id');
+        if ($single) {
+            $id = (int) $single;
+            if ($id > 0) $ids[] = $id;
+        }
+
+        $ids = array_values(array_unique($ids));
+        return $ids ?: null;
+    }
+
+    /**
+     * @param array<int>|null $categoryIds
+     * @return array{0: string, 1: array<int>}
+     */
+    private function categoryFilterSql(?array $categoryIds): array {
+        if (!$categoryIds || count($categoryIds) === 0) {
+            return ['', []];
+        }
+        $placeholders = implode(',', array_fill(0, count($categoryIds), '?'));
+        return ["AND d.category_id IN ($placeholders)", $categoryIds];
+    }
+
     /**
      * @return array{for_llm: array<int, array<string, mixed>>, for_fallback: array<int, array<string, mixed>>}
      */
-    private function retrieveChunks(string $question, ?int $categoryId, int $limit): array {
+    private function retrieveChunks(string $question, ?array $categoryIds, int $limit): array {
         $limit      = max(1, $limit);
         // Fetch extra candidates so reranking can promote substantive pages over TOC hits.
         $fetchLimit = min($limit * 3, 24);
         $terms      = $this->extractSearchTerms($question);
 
-        $chunks = $this->searchChunks($terms['natural'], $categoryId, $fetchLimit, 'natural');
+        $chunks = $this->searchChunks($terms['natural'], $categoryIds, $fetchLimit, 'natural');
 
         if (empty($chunks) && $terms['boolean'] !== '') {
-            $chunks = $this->searchChunks($terms['boolean'], $categoryId, $fetchLimit, 'boolean');
+            $chunks = $this->searchChunks($terms['boolean'], $categoryIds, $fetchLimit, 'boolean');
         }
 
         // Typo-tolerant pass: prefix wildcards recover misspelled words.
         if (empty($chunks) && ($terms['fuzzy'] ?? '') !== '' && $terms['fuzzy'] !== $terms['boolean']) {
-            $chunks = $this->searchChunks($terms['fuzzy'], $categoryId, $fetchLimit, 'boolean');
+            $chunks = $this->searchChunks($terms['fuzzy'], $categoryIds, $fetchLimit, 'boolean');
             if (!empty($chunks)) {
                 Logger::info('[retrieval] fuzzy prefix search matched after exact search failed');
             }
         }
 
         if (empty($chunks) && !empty($terms['keywords'])) {
-            $chunks = $this->likeSearchChunks($terms['keywords'], $categoryId, $fetchLimit);
+            $chunks = $this->likeSearchChunks($terms['keywords'], $categoryIds, $fetchLimit);
         }
 
         // LIKE with typo-tolerant prefixes as the final lexical fallback.
@@ -633,7 +721,7 @@ class ChatController {
                 fn($w) => strlen($w) >= 6 ? substr($w, 0, max(4, strlen($w) - 3)) : $w,
                 $terms['keywords']
             );
-            $chunks = $this->likeSearchChunks($prefixes, $categoryId, $fetchLimit);
+            $chunks = $this->likeSearchChunks($prefixes, $categoryIds, $fetchLimit);
         }
 
         $chunks = $this->filterUsefulChunks($chunks);
@@ -660,7 +748,7 @@ class ChatController {
 
         Logger::info("[retrieval]\n"
             . 'question=' . mb_substr($question, 0, 80) . "\n"
-            . 'category_id=' . ($categoryId ?? 'all') . "\n"
+            . 'category_ids=' . ($categoryIds ? implode(',', $categoryIds) : 'all') . "\n"
             . 'retrieved_chunk_count=' . count($forFallback) . "\n"
             . 'after_toc_filter_count=' . count($forLlm) . "\n"
             . "Retrieved chunks:\n"
@@ -772,17 +860,14 @@ class ChatController {
         ];
     }
 
-    private function searchChunks(string $expr, ?int $categoryId, int $limit, string $mode): array {
+    private function searchChunks(string $expr, ?array $categoryIds, int $limit, string $mode): array {
         if ($expr === '') {
             return [];
         }
 
         $modeSql     = $mode === 'boolean' ? 'BOOLEAN MODE' : 'NATURAL LANGUAGE MODE';
-        $categorySql = $categoryId ? 'AND d.category_id = ?' : '';
-        $binds       = [$expr, $expr];
-        if ($categoryId) {
-            $binds[] = $categoryId;
-        }
+        [$categorySql, $categoryBinds] = $this->categoryFilterSql($categoryIds);
+        $binds       = [$expr, $expr, ...$categoryBinds];
         $binds[] = $limit;
 
         try {
@@ -806,7 +891,7 @@ class ChatController {
         }
     }
 
-    private function likeSearchChunks(array $keywords, ?int $categoryId, int $limit): array {
+    private function likeSearchChunks(array $keywords, ?array $categoryIds, int $limit): array {
         $likes = [];
         $binds = [];
 
@@ -822,9 +907,9 @@ class ChatController {
             return [];
         }
 
-        $categorySql = $categoryId ? 'AND d.category_id = ?' : '';
-        if ($categoryId) {
-            $binds[] = $categoryId;
+        [$categorySql, $categoryBinds] = $this->categoryFilterSql($categoryIds);
+        foreach ($categoryBinds as $b) {
+            $binds[] = $b;
         }
         $binds[] = $limit;
 

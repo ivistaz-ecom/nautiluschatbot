@@ -66,11 +66,13 @@ export class ApiError extends Error {
 async function requestLocalAsk(
   question: string,
   sessionId?: string,
-  categoryId?: number
+  categoryIds?: number[]
 ): Promise<{ data: AskResponse }> {
   const token = getToken();
   const headers: HeadersInit = { 'Content-Type': 'application/json' };
   if (token) headers['Authorization'] = `Bearer ${token}`;
+
+  const ids = (categoryIds ?? []).map(Number).filter((n) => n > 0);
 
   const res = await fetch('/api/chat/ask', {
     method: 'POST',
@@ -78,13 +80,27 @@ async function requestLocalAsk(
     body: JSON.stringify({
       question,
       ...(sessionId && { session_id: sessionId }),
-      ...(categoryId && { category_id: categoryId }),
+      ...(ids.length === 1 ? { category_id: ids[0] } : {}),
+      ...(ids.length > 0 ? { category_ids: ids } : {}),
     }),
   });
 
   const data = await res.json();
   if (!res.ok) {
     throw new ApiError(data.message || 'Request failed', res.status, data.errors);
+  }
+  return data;
+}
+
+async function requestLocalChatCategories(): Promise<{ data: Category[] }> {
+  const token = getToken();
+  const headers: HeadersInit = {};
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+
+  const res = await fetch('/api/chat/categories', { headers, cache: 'no-store' });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new ApiError(data.message || 'Failed to load categories', res.status, data.errors);
   }
   return data;
 }
@@ -164,6 +180,19 @@ async function requestLocalDocumentUpdate<T>(
   return payload as T;
 }
 
+async function requestLocalAdminCategories(): Promise<{ data: Category[] }> {
+  const token = getToken();
+  const headers: HeadersInit = {};
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+
+  const res = await fetch('/api/admin/categories', { headers, cache: 'no-store' });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new ApiError(data.message || 'Failed to load categories', res.status, data.errors);
+  }
+  return data;
+}
+
 async function requestLocalKnowledgeHealth(): Promise<{ data: KnowledgeHealthReport }> {
   const token = getToken();
   const headers: HeadersInit = {};
@@ -194,10 +223,10 @@ export const api = {
 
   // Chat
   chat: {
-    ask: (question: string, sessionId?: string, categoryId?: number) =>
+    ask: (question: string, sessionId?: string, categoryIds?: number[]) =>
       // Route through Next.js proxy so empty live-API sources can be enriched
       // with a matching PDF until the PHP attribution fix is deployed.
-      requestLocalAsk(question, sessionId, categoryId),
+      requestLocalAsk(question, sessionId, categoryIds),
     sessions: (page = 1) =>
       request<PaginatedResponse<ChatSession>>('GET', `/chat/sessions?page=${page}`),
     session: (id: string) =>
@@ -206,7 +235,23 @@ export const api = {
     deleteSession: (id: string) => request('DELETE', `/chat/sessions/${id}`),
     faqs: (categoryId?: number, limit = 20) =>
       request<{ data: FAQ[] }>('GET', `/chat/faqs?limit=${limit}${categoryId ? `&category_id=${categoryId}` : ''}`),
-    categories: () => request<{ data: Category[] }>('GET', '/chat/categories'),
+    categories: () =>
+      // Local BFF: only categories that currently have ready PDFs.
+      requestLocalChatCategories(),
+    documents: (categoryId?: number) =>
+      request<{
+        data: Array<{
+          id: number;
+          title: string;
+          original_filename?: string;
+          mime_type?: string;
+          category_id: number;
+          category_name: string;
+        }>;
+      }>(
+        'GET',
+        `/chat/documents?status=ready${categoryId ? `&category_id=${categoryId}` : ''}`
+      ),
     submitQuery: (question: string, messageId?: string) =>
       request('POST', '/chat/submit-query', { question, ...(messageId && { message_id: messageId }) }),
     documentFile: (documentId: number) => fetchDocumentFile(documentId),
@@ -237,7 +282,7 @@ export const api = {
     },
 
     categories: {
-      list: () => request<{ data: Category[] }>('GET', '/admin/categories'),
+      list: () => requestLocalAdminCategories(),
       create: (data: Partial<Category>) => request('POST', '/admin/categories', data as Record<string, unknown>),
       update: (id: number, data: Partial<Category>) =>
         request('PUT', `/admin/categories/${id}`, data as Record<string, unknown>),
@@ -328,6 +373,9 @@ export interface MessageSource {
   /** Retrieval / FULLTEXT score when the API provides it. */
   score?: number;
   mime_type?: string;
+  /** Category the source document belongs to. */
+  category_id?: number | null;
+  category_name?: string | null;
   /** Pre-built document URL from the API (without #page=). */
   pdf_url?: string;
   // CamelCase aliases (preferred API contract going forward)

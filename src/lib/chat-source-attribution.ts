@@ -4,6 +4,18 @@ import { synthesizeAnswerFromPassages } from './pdf-llm-answer';
 
 export type SourceLike = Record<string, unknown>;
 
+function normalizeCategoryIds(
+  categoryIds?: number | number[] | null
+): number[] | undefined {
+  if (categoryIds == null) return undefined;
+  const arr = Array.isArray(categoryIds) ? categoryIds : [categoryIds];
+  const cleaned = Array.from(
+    new Set(arr.map(Number).filter((n) => Number.isFinite(n) && n > 0))
+  );
+  return cleaned.length > 0 ? cleaned : undefined;
+}
+
+
 /** Per-request cache so one session load does not re-download the same PDF. */
 const pdfPagesCache = new Map<number, string[]>();
 
@@ -35,6 +47,8 @@ function sourceFromHit(hit: AnswerHit): SourceLike {
     physical_page: hit.physicalPage,
     fileId: hit.fileId,
     fileName: hit.fileName,
+    category_id: hit.categoryId ?? null,
+    category_name: hit.categoryName ?? null,
     mime_type: 'application/pdf',
     relevance_rank: 1,
     excerpt,
@@ -77,7 +91,17 @@ export function dedupeSources(sources: SourceLike[]): SourceLike[] {
 }
 
 function isNotFoundAnswer(answer: string): boolean {
-  return /could not find|not found in the (available )?documents|not found in the knowledge base/i.test(answer);
+  return /could not find|not found in the (available )?documents|not found in the knowledge base|not found in the selected categor/i.test(
+    answer
+  );
+}
+
+function notFoundInSelectedCategoriesMessage(categoryIds?: number[]): string {
+  const n = categoryIds?.length ?? 0;
+  if (n <= 1) {
+    return 'The given question was not found in the selected category.';
+  }
+  return 'The given question was not found in the selected categories.';
 }
 
 /** Build PDF deep links from existing page numbers — never re-scan the PDF. */
@@ -202,14 +226,16 @@ async function locateSourcesFromChunks(
   question: string,
   answer: string,
   documentId?: number,
-  categoryId?: number
+  categoryIds?: number[]
 ): Promise<SourceLike[] | null> {
   if (!auth || !question.trim()) return null;
 
   const params = new URLSearchParams({ q: question });
   if (answer.trim()) params.set('answer', answer.slice(0, 800));
   if (documentId && documentId > 0) params.set('document_id', String(documentId));
-  if (categoryId && categoryId > 0) params.set('category_id', String(categoryId));
+  const ids = normalizeCategoryIds(categoryIds);
+  if (ids?.length === 1) params.set('category_id', String(ids[0]));
+  if (ids && ids.length > 1) params.set('category_ids', ids.join(','));
 
   try {
     const res = await fetch(`${API_BACKEND_URL}/chat/locate-source?${params}`, {
@@ -338,11 +364,11 @@ export async function locateSourcesForQuestion(
   question: string,
   answer: string,
   documentId?: number,
-  categoryId?: number
+  categoryIds?: number[]
 ): Promise<SourceLike[]> {
   if (!auth || !question.trim()) return [];
 
-  const hits = await findTopAnswerHits(auth, question, documentId, categoryId);
+  const hits = await findTopAnswerHits(auth, question, documentId, categoryIds);
   if (hits.length === 0) return [];
 
   // Heading-style queries: only cite when we found the real section page.
@@ -368,9 +394,9 @@ async function finalizeVerifiedSources(
   question: string,
   answer: string,
   sources: SourceLike[],
-  categoryId?: number
+  categoryIds?: number[]
 ): Promise<SourceLike[]> {
-  const located = await locateSourcesForQuestion(auth, question, answer, undefined, categoryId);
+  const located = await locateSourcesForQuestion(auth, question, answer, undefined, categoryIds);
   if (located.length > 0) {
     return finalizeSourceLinks(auth, located);
   }
@@ -424,25 +450,54 @@ export async function resolveAssistantTurn(
   answer: string,
   isAnswered: boolean,
   rawSources: SourceLike[] | null | undefined,
-  categoryId?: number
+  categoryIds?: number | number[]
 ): Promise<{ answer: string; is_answered: boolean; sources: SourceLike[] }> {
   if (!auth || !question.trim()) {
     return { answer, is_answered: isAnswered, sources: [] };
   }
 
-  const scopedCategoryId = categoryId && categoryId > 0 ? categoryId : undefined;
-  const allowedDocIds = scopedCategoryId
-    ? new Set((await listReadyPdfDocuments(auth, scopedCategoryId)).map((d) => d.id))
+  const scopedCategoryIds = normalizeCategoryIds(categoryIds);
+  const allowedDocs = scopedCategoryIds
+    ? await listReadyPdfDocuments(auth, scopedCategoryIds)
+    : [];
+  const allowedDocIds = scopedCategoryIds
+    ? new Set(allowedDocs.map((d) => d.id))
     : null;
 
-  const hits = await findTopAnswerHits(auth, question, undefined, scopedCategoryId);
-  const hit = hits[0] ?? null;
-  const needsBetterAnswer =
-    !isAnswered || isNotFoundAnswer(answer) || looksLikeRawDump(answer);
+  // When manuals are selected, ignore upstream answers/sources outside that scope.
+  const inScopeRawSources = scopedCategoryIds
+    ? filterSourcesByCategory(
+        Array.isArray(rawSources) ? rawSources : [],
+        scopedCategoryIds,
+        allowedDocIds
+      )
+    : Array.isArray(rawSources)
+      ? rawSources
+      : [];
 
-  // Even when the API returns an answer, prefer a strong PDF topic match
-  // (e.g. "superintendent inspections") over a weak keyword hit
-  // (e.g. "annual inspection").
+  const hits = await findTopAnswerHits(auth, question, undefined, scopedCategoryIds);
+  const hit = hits[0] ?? null;
+  const hasScopedHits = Boolean(hit && hit.score >= MIN_HIT_SCORE);
+
+  // Strict category mode: no in-scope PDF match and no in-scope citations → not found.
+  if (scopedCategoryIds && !hasScopedHits && inScopeRawSources.length === 0) {
+    return {
+      answer: notFoundInSelectedCategoriesMessage(scopedCategoryIds),
+      is_answered: false,
+      sources: [],
+    };
+  }
+
+  const needsBetterAnswer =
+    !isAnswered ||
+    isNotFoundAnswer(answer) ||
+    looksLikeRawDump(answer) ||
+    // Upstream may have answered from other manuals — rebuild from scoped hits.
+    Boolean(scopedCategoryIds && isAnswered && !hasScopedHits && inScopeRawSources.length === 0);
+
+  // Prefer scoped PDF recovery when category filter is active.
+  const preferScopedRecovery = Boolean(scopedCategoryIds && hasScopedHits);
+
   const strongPdfHit =
     Boolean(hit) &&
     (phraseMatchScore(hit!.sentence + ' ' + hit!.pageText, question) >= 0.65 ||
@@ -454,10 +509,24 @@ export async function resolveAssistantTurn(
     phraseMatchScore(answer, question) < 0.5 &&
     topicCoverage(answer, question) < 0.6;
 
-  let finalAnswer = answer;
-  let finalAnswered = isAnswered && !isNotFoundAnswer(answer);
+  let finalAnswer = scopedCategoryIds && !hasScopedHits && inScopeRawSources.length === 0
+    ? ''
+    : answer;
+  let finalAnswered =
+    Boolean(isAnswered) &&
+    !isNotFoundAnswer(answer) &&
+    !(scopedCategoryIds && !hasScopedHits && inScopeRawSources.length === 0);
 
-  if ((needsBetterAnswer || (strongPdfHit && apiTopicWeak)) && hits.length > 0) {
+  // When category-scoped, only keep upstream answer if we also have in-scope evidence.
+  if (scopedCategoryIds && finalAnswered && !hasScopedHits && inScopeRawSources.length === 0) {
+    finalAnswered = false;
+    finalAnswer = '';
+  }
+
+  if (
+    (needsBetterAnswer || preferScopedRecovery || (strongPdfHit && apiTopicWeak)) &&
+    hits.length > 0
+  ) {
     const llmPassages = hits.slice(0, 3).map((h) => ({
       fileName: h.fileName,
       page: h.physicalPage,
@@ -465,11 +534,9 @@ export async function resolveAssistantTurn(
     }));
     const synthesized = await synthesizeAnswerFromPassages(question, llmPassages);
     const extracted = buildDetailedAnswer(hit!.pageText, question, hit!.sentence);
-    // Prefer LLM when available; otherwise use the full relevant PDF passage.
     const candidate = synthesized || extracted;
 
     if (candidate && candidate.length >= 15 && !isNotFoundAnswer(candidate)) {
-      // Keep a longer extractive passage when the model is overly brief.
       if (
         synthesized &&
         extracted &&
@@ -485,7 +552,6 @@ export async function resolveAssistantTurn(
     }
   }
 
-  // PDF hit with no API answer — still answer from the matched passage.
   if (!finalAnswered && hit && hit.score >= MIN_HIT_SCORE) {
     const extracted = buildDetailedAnswer(hit.pageText, question, hit.sentence);
     if (extracted && extracted.length >= 15) {
@@ -494,7 +560,6 @@ export async function resolveAssistantTurn(
     }
   }
 
-  // API answer exists but is too short — expand with the relevant PDF section.
   if (
     finalAnswered &&
     hit &&
@@ -508,14 +573,19 @@ export async function resolveAssistantTurn(
   }
 
   if (!finalAnswered) {
-    return { answer: finalAnswer || answer, is_answered: false, sources: [] };
+    return {
+      answer: scopedCategoryIds
+        ? notFoundInSelectedCategoriesMessage(scopedCategoryIds)
+        : finalAnswer || answer,
+      is_answered: false,
+      sources: [],
+    };
   }
 
   let sources: SourceLike[] = [];
 
   if (hits.length > 0) {
     const scored = hits.filter((h) => h.score >= MIN_HIT_SCORE);
-    // Heading gate only for true section-title queries; never drop all hits.
     const headingStrict = isHeadingStyleQuestion(question)
       ? scored.filter((h) => h.headingScore >= 0.65)
       : scored;
@@ -537,7 +607,7 @@ export async function resolveAssistantTurn(
       question,
       finalAnswer,
       undefined,
-      scopedCategoryId
+      scopedCategoryIds
     );
     if (chunkSources?.length) {
       sources = finalizeSourceLinks(auth, dedupeSources(chunkSources));
@@ -545,16 +615,38 @@ export async function resolveAssistantTurn(
   }
 
   if (!sources.length) {
-    const fallback = Array.isArray(rawSources) ? dedupeSources(rawSources) : [];
-    sources = await finalizeVerifiedSources(auth, question, finalAnswer, fallback, scopedCategoryId);
+    const fallback = dedupeSources(inScopeRawSources);
+    sources = await finalizeVerifiedSources(
+      auth,
+      question,
+      finalAnswer,
+      fallback,
+      scopedCategoryIds
+    );
   }
 
-  // Always merge upstream API citations with locally grounded sources.
-  if (Array.isArray(rawSources) && rawSources.length > 0) {
+  if (!scopedCategoryIds && Array.isArray(rawSources) && rawSources.length > 0) {
     sources = mergeAssistantSources(auth, sources, rawSources);
+  } else if (scopedCategoryIds && inScopeRawSources.length > 0) {
+    sources = mergeAssistantSources(
+      auth,
+      sources,
+      inScopeRawSources,
+      scopedCategoryIds,
+      allowedDocIds
+    );
   }
 
-  sources = filterSourcesByCategory(sources, scopedCategoryId, allowedDocIds);
+  sources = filterSourcesByCategory(sources, scopedCategoryIds, allowedDocIds);
+
+  // Category filter active but nothing in-scope to cite → treat as not found.
+  if (scopedCategoryIds && sources.length === 0) {
+    return {
+      answer: notFoundInSelectedCategoriesMessage(scopedCategoryIds),
+      is_answered: false,
+      sources: [],
+    };
+  }
 
   return {
     answer: finalAnswer,
@@ -825,91 +917,120 @@ type ReadyPdfDoc = {
 
 function filterSourcesByCategory(
   sources: SourceLike[],
-  categoryId?: number,
+  categoryIds?: number[],
   allowedDocIds?: Set<number> | null
 ): SourceLike[] {
-  if (!categoryId || sources.length === 0) return sources;
+  const ids = normalizeCategoryIds(categoryIds);
+  if (!ids || sources.length === 0) return sources;
+  const idSet = new Set(ids);
 
-  const filtered = sources.filter((src) => {
+  return sources.filter((src) => {
     const srcCategory = Number(src.category_id ?? src.categoryId ?? 0);
-    if (srcCategory === categoryId) return true;
+    if (srcCategory > 0 && idSet.has(srcCategory)) return true;
     const fileId = getFileId(src);
     if (fileId > 0 && allowedDocIds && allowedDocIds.size > 0) {
       return allowedDocIds.has(fileId);
     }
-    // When we cannot verify membership, keep sources without category metadata.
-    return srcCategory === 0;
+    // Strict: when filtering by category, drop sources we cannot verify.
+    return false;
   });
-
-  // Never drop every source because the category doc list could not be loaded.
-  if (filtered.length === 0 && (!allowedDocIds || allowedDocIds.size === 0)) {
-    return sources;
-  }
-
-  return filtered;
 }
 
 /** Merge resolved + upstream API sources and attach PDF deep links. */
 export function mergeAssistantSources(
   auth: string,
   resolved: SourceLike[],
-  raw: SourceLike[]
+  raw: SourceLike[],
+  categoryIds?: number[],
+  allowedDocIds?: Set<number> | null
 ): SourceLike[] {
   const merged = dedupeSources([...resolved, ...raw]);
-  return merged.length > 0 ? finalizeSourceLinks(auth, merged) : [];
+  const scoped = filterSourcesByCategory(merged, categoryIds, allowedDocIds);
+  return scoped.length > 0 ? finalizeSourceLinks(auth, scoped) : [];
 }
 
-async function listReadyPdfDocuments(auth: string, categoryId?: number): Promise<ReadyPdfDoc[]> {
-  const params = new URLSearchParams({ status: 'ready' });
-  if (categoryId && categoryId > 0) {
-    params.set('category_id', String(categoryId));
+async function listReadyPdfDocuments(auth: string, categoryIds?: number[]): Promise<ReadyPdfDoc[]> {
+  const ids = normalizeCategoryIds(categoryIds);
+
+  const mapDocs = (docs: Array<Record<string, unknown>>): ReadyPdfDoc[] => {
+    const mapped = docs
+      .map((doc) => ({
+        id: Number(doc.id),
+        title: String(doc.title || doc.original_filename || 'Document'),
+        original_filename: doc.original_filename ? String(doc.original_filename) : undefined,
+        category_id: doc.category_id != null ? Number(doc.category_id) : undefined,
+        category_name: doc.category_name ? String(doc.category_name) : undefined,
+        mime: String(doc.mime_type || ''),
+        name: String(doc.original_filename || '').toLowerCase(),
+      }))
+      .filter(
+        (doc) =>
+          doc.id > 0 &&
+          (doc.mime === 'application/pdf' || doc.name.endsWith('.pdf'))
+      )
+      .map(({ id, title, original_filename, category_id, category_name }) => ({
+        id,
+        title,
+        original_filename,
+        category_id,
+        category_name,
+      }));
+
+    if (!ids || ids.length === 0) return mapped;
+    return mapped.filter((d) => d.category_id != null && ids.includes(Number(d.category_id)));
+  };
+
+  const chatParams = new URLSearchParams({ status: 'ready' });
+  if (ids?.length === 1) chatParams.set('category_id', String(ids[0]));
+  else if (ids && ids.length > 1) chatParams.set('category_ids', ids.join(','));
+
+  try {
+    const res = await fetch(`${API_BACKEND_URL}/chat/documents?${chatParams}`, {
+      headers: { Authorization: auth },
+      cache: 'no-store',
+    });
+    if (res.ok) {
+      const json = await res.json();
+      const docs: Array<Record<string, unknown>> = Array.isArray(json?.data) ? json.data : [];
+      const mapped = mapDocs(docs);
+      if (mapped.length > 0) return mapped;
+    }
+  } catch {
+    // fall through to admin pagination
   }
 
-  const endpoints = [
-    `${API_BACKEND_URL}/chat/documents?${params}`,
-    `${API_BACKEND_URL}/admin/documents?per_page=100&${params}`,
-  ];
+  const all: ReadyPdfDoc[] = [];
+  for (let page = 1; page <= 50; page++) {
+    const params = new URLSearchParams({
+      status: 'ready',
+      per_page: '100',
+      page: String(page),
+    });
+    if (ids?.length === 1) params.set('category_id', String(ids[0]));
 
-  for (const url of endpoints) {
     try {
-      const res = await fetch(url, {
+      const res = await fetch(`${API_BACKEND_URL}/admin/documents?${params}`, {
         headers: { Authorization: auth },
         cache: 'no-store',
       });
-      if (!res.ok) continue;
-
+      if (!res.ok) break;
       const json = await res.json();
       const docs: Array<Record<string, unknown>> = Array.isArray(json?.data) ? json.data : [];
-      const mapped = docs
-        .map((doc) => ({
-          id: Number(doc.id),
-          title: String(doc.title || doc.original_filename || 'Document'),
-          original_filename: doc.original_filename ? String(doc.original_filename) : undefined,
-          category_id: doc.category_id != null ? Number(doc.category_id) : undefined,
-          category_name: doc.category_name ? String(doc.category_name) : undefined,
-          mime: String(doc.mime_type || ''),
-          name: String(doc.original_filename || '').toLowerCase(),
-        }))
-        .filter(
-          (doc) =>
-            doc.id > 0 &&
-            (doc.mime === 'application/pdf' || doc.name.endsWith('.pdf'))
-        )
-        .map(({ id, title, original_filename, category_id, category_name }) => ({
-          id,
-          title,
-          original_filename,
-          category_id,
-          category_name,
-        }));
-
-      if (mapped.length > 0) return mapped;
+      if (docs.length === 0) break;
+      all.push(...mapDocs(docs));
+      const totalPages = Number(json?.meta?.total_pages || 0);
+      if (totalPages > 0 && page >= totalPages) break;
+      if (docs.length < 100) break;
     } catch {
-      // try next endpoint
+      break;
     }
   }
 
-  return [];
+  // When multi-select and admin only filtered one id, filter client-side.
+  if (ids && ids.length > 1) {
+    return all.filter((d) => d.category_id != null && ids.includes(Number(d.category_id)));
+  }
+  return all;
 }
 
 function isBoilerplateLine(line: string): boolean {
@@ -1192,6 +1313,8 @@ function splitSentences(text: string): string[] {
 type AnswerHit = {
   fileId: number;
   fileName: string;
+  categoryId?: number;
+  categoryName?: string;
   physicalPage: number;
   printedPage: number | null;
   sentence: string;
@@ -1228,9 +1351,9 @@ async function findTopAnswerHits(
   auth: string,
   question: string,
   onlyDocumentId?: number,
-  categoryId?: number
+  categoryIds?: number[]
 ): Promise<AnswerHit[]> {
-  const docs = await listReadyPdfDocuments(auth, categoryId);
+  const docs = await listReadyPdfDocuments(auth, categoryIds);
   if (docs.length === 0) return [];
 
   const tokens = significantTokens(question);
@@ -1277,6 +1400,8 @@ async function findTopAnswerHits(
       const makeHit = (sentence: string, score: number): AnswerHit => ({
         fileId: doc.id,
         fileName: doc.title,
+        categoryId: doc.category_id,
+        categoryName: doc.category_name,
         physicalPage,
         printedPage: extractPrintedPageNumber(content),
         sentence,
@@ -1350,12 +1475,12 @@ function extractAnswerSentences(pageText: string, question: string): string {
 export async function recoverAnswerFromDocuments(
   auth: string,
   question: string,
-  categoryId?: number
+  categoryIds?: number[]
 ): Promise<{ answer: string; sources: SourceLike[] } | null> {
   if (!auth || !question.trim()) return null;
 
-  const scopedCategoryId = categoryId && categoryId > 0 ? categoryId : undefined;
-  const hits = await findTopAnswerHits(auth, question, undefined, scopedCategoryId);
+  const scopedCategoryIds = normalizeCategoryIds(categoryIds);
+  const hits = await findTopAnswerHits(auth, question, undefined, scopedCategoryIds);
   const hit = hits[0];
   if (!hit || hit.score < MIN_HIT_SCORE) return null;
 

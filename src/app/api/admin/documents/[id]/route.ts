@@ -5,37 +5,13 @@ import {
   verifyAdminToken,
   type DocumentUpdateInput,
 } from '@/lib/document-db-update';
-import { saveDocumentOverride } from '@/lib/document-overrides-store';
+import {
+  saveDocumentOverride,
+  clearDocumentOverride,
+} from '@/lib/document-overrides-store';
+import { forwardDocumentUpdateToPhp } from '@/lib/document-update-sync';
 
 export const dynamic = 'force-dynamic';
-
-async function forwardToPhp(
-  id: number,
-  auth: string,
-  body: Record<string, unknown>
-): Promise<Response | null> {
-  const headers: HeadersInit = {
-    'Content-Type': 'application/json',
-    ...(auth ? { Authorization: auth } : {}),
-  };
-  const json = JSON.stringify(body);
-  const base = API_BACKEND_URL.replace(/\/$/, '');
-
-  const attempts: { url: string; method: 'PUT' | 'POST' }[] = [
-    { url: `${base}/admin/documents/${id}`, method: 'PUT' },
-    { url: `${base}/admin/documents/${id}/update`, method: 'POST' },
-    { url: `${base}/document-update.php?id=${id}`, method: 'POST' },
-  ];
-
-  for (const { url, method } of attempts) {
-    const res = await fetch(url, { method, headers, body: json });
-    if (res.status !== 404) {
-      return res;
-    }
-  }
-
-  return null;
-}
 
 function parseBody(body: Record<string, unknown>): DocumentUpdateInput {
   return {
@@ -59,53 +35,69 @@ export async function PUT(
     return NextResponse.json({ success: false, message: 'Invalid document id' }, { status: 400 });
   }
 
-  const body = await req.json().catch(() => ({}));
+  const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
   const input = parseBody(body);
 
-  const phpRes = await forwardToPhp(docId, auth, body);
-  if (phpRes) {
-    const payload = await phpRes.json().catch(() => ({}));
-    return NextResponse.json(payload, { status: phpRes.status });
+  if (!input.title) {
+    return NextResponse.json({ success: false, message: 'Document name is required' }, { status: 422 });
+  }
+  if (!Number.isFinite(input.category_id) || input.category_id <= 0) {
+    return NextResponse.json({ success: false, message: 'Invalid category' }, { status: 422 });
   }
 
-  // PHP routes missing on server — update database directly when configured.
+  // 1) Live PHP API (production source of truth for chat + category counts)
+  const phpResult = await forwardDocumentUpdateToPhp(docId, auth, body);
+  if (phpResult?.ok) {
+    clearDocumentOverride(docId);
+    return NextResponse.json(phpResult.payload, { status: phpResult.status });
+  }
+  if (phpResult && !phpResult.ok && (phpResult.status === 401 || phpResult.status === 403 || phpResult.status === 422)) {
+    return NextResponse.json(phpResult.payload, { status: phpResult.status });
+  }
+
   const isAdmin = await verifyAdminToken(auth, API_BACKEND_URL);
   if (!isAdmin) {
     return NextResponse.json({ success: false, message: 'Authentication required' }, { status: 401 });
   }
 
+  // 2) Direct DB update when local/API DB credentials are configured
   try {
     const doc = await updateDocumentInDb(docId, input);
+    clearDocumentOverride(docId);
     return NextResponse.json({ success: true, data: doc, message: 'Document updated' });
   } catch (err) {
-    if (err instanceof Error && err.message === 'DB_NOT_CONFIGURED') {
-      const categoryName =
-        typeof body.category_name === 'string' ? body.category_name.trim() : '';
-
-      const saved = saveDocumentOverride(docId, {
-        title: input.title,
-        category_id: input.category_id,
-        category_name: categoryName || undefined,
-        original_filename: input.original_filename,
-      });
-
-      return NextResponse.json({
-        success: true,
-        data: {
-          id: docId,
-          title: saved.title,
-          original_filename: saved.original_filename ?? input.original_filename ?? '',
-          category_id: saved.category_id,
-          category_name: saved.category_name ?? categoryName,
-        },
-        message:
-          'Saved locally on this dev machine. Upload document-update.php to production for chat to use the new name.',
-        local_only: true,
-      });
+    if (!(err instanceof Error && err.message === 'DB_NOT_CONFIGURED')) {
+      const message = err instanceof Error ? err.message : 'Update failed';
+      const status = message === 'Document not found' ? 404 : message.includes('category') ? 422 : 500;
+      return NextResponse.json({ success: false, message }, { status });
     }
-
-    const message = err instanceof Error ? err.message : 'Update failed';
-    const status = message === 'Document not found' ? 404 : message.includes('category') ? 422 : 500;
-    return NextResponse.json({ success: false, message }, { status });
   }
+
+  // 3) Last resort: local override only (does NOT update live chat/category counts)
+  const categoryName =
+    typeof body.category_name === 'string' ? body.category_name.trim() : '';
+
+  const saved = saveDocumentOverride(docId, {
+    title: input.title,
+    category_id: input.category_id,
+    category_name: categoryName || undefined,
+    original_filename: input.original_filename,
+  });
+
+  return NextResponse.json(
+    {
+      success: false,
+      local_only: true,
+      data: {
+        id: docId,
+        title: saved.title,
+        original_filename: saved.original_filename ?? input.original_filename ?? '',
+        category_id: saved.category_id,
+        category_name: saved.category_name ?? categoryName,
+      },
+      message:
+        'Could not update the live database. Upload nautilusapi/document-update.php (or the latest DocumentController) to the server, or set API_DB_* in .env.local. Category counts and chat filters will stay wrong until the live DB is updated.',
+    },
+    { status: 502 }
+  );
 }
