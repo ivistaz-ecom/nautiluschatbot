@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 
 export type DocumentOverride = {
   title: string;
@@ -9,13 +10,33 @@ export type DocumentOverride = {
   updated_at: string;
 };
 
-const DIR = path.join(process.cwd(), 'data');
-const FILE = path.join(DIR, 'document-overrides.json');
+function resolveStorePath(): string {
+  // Vercel’s app filesystem is read-only; prefer /tmp when cwd/data is not writable.
+  const primaryDir = path.join(process.cwd(), 'data');
+  try {
+    if (!fs.existsSync(primaryDir)) {
+      fs.mkdirSync(primaryDir, { recursive: true });
+    }
+    fs.accessSync(primaryDir, fs.constants.W_OK);
+    return path.join(primaryDir, 'document-overrides.json');
+  } catch {
+    const tmpDir = path.join(os.tmpdir(), 'nautilus-overrides');
+    try {
+      if (!fs.existsSync(tmpDir)) {
+        fs.mkdirSync(tmpDir, { recursive: true });
+      }
+      return path.join(tmpDir, 'document-overrides.json');
+    } catch {
+      return path.join(primaryDir, 'document-overrides.json');
+    }
+  }
+}
 
 function readAll(): Record<string, DocumentOverride> {
   try {
-    if (!fs.existsSync(FILE)) return {};
-    const raw = fs.readFileSync(FILE, 'utf8');
+    const file = resolveStorePath();
+    if (!fs.existsSync(file)) return {};
+    const raw = fs.readFileSync(file, 'utf8');
     const parsed = JSON.parse(raw);
     return parsed && typeof parsed === 'object' ? parsed : {};
   } catch {
@@ -24,10 +45,12 @@ function readAll(): Record<string, DocumentOverride> {
 }
 
 function writeAll(data: Record<string, DocumentOverride>): void {
-  if (!fs.existsSync(DIR)) {
-    fs.mkdirSync(DIR, { recursive: true });
+  const file = resolveStorePath();
+  const dir = path.dirname(file);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
   }
-  fs.writeFileSync(FILE, JSON.stringify(data, null, 2), 'utf8');
+  fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8');
 }
 
 export function getDocumentOverrides(): Record<string, DocumentOverride> {
@@ -48,13 +71,22 @@ export function saveDocumentOverride(
     updated_at: new Date().toISOString(),
   };
   all[String(id)] = entry;
-  writeAll(all);
+  try {
+    writeAll(all);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Unable to write overrides';
+    throw new Error(`OVERRIDE_STORE_READONLY:${message}`);
+  }
   return entry;
 }
 
 export function clearDocumentOverride(id: number): void {
-  const all = readAll();
-  if (!(String(id) in all)) return;
-  delete all[String(id)];
-  writeAll(all);
+  try {
+    const all = readAll();
+    if (!(String(id) in all)) return;
+    delete all[String(id)];
+    writeAll(all);
+  } catch {
+    // Best-effort — never block a successful live DB update.
+  }
 }

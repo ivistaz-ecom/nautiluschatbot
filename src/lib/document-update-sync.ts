@@ -25,6 +25,8 @@ export async function forwardDocumentUpdateToPhp(
   const attempts: { url: string; method: 'PUT' | 'POST' }[] = [
     { url: `${base}/admin/documents/${id}/update`, method: 'POST' },
     { url: `${base}/document-update.php?id=${id}`, method: 'POST' },
+    // Some hosts place standalone PHP next to /api (not under /v1).
+    { url: `${base.replace(/\/v1$/, '')}/document-update.php?id=${id}`, method: 'POST' },
     { url: `${base}/admin/documents/${id}`, method: 'PUT' },
     { url: `${base}/admin/documents/${id}`, method: 'POST' },
   ];
@@ -38,7 +40,16 @@ export async function forwardDocumentUpdateToPhp(
         continue;
       }
 
-      const payload = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+      const raw = await res.text();
+      let payload: Record<string, unknown> = {};
+      if (raw.trim()) {
+        try {
+          payload = JSON.parse(raw) as Record<string, unknown>;
+        } catch {
+          payload = { message: raw.slice(0, 200) };
+        }
+      }
+
       if (res.ok) {
         return { ok: true, status: res.status, payload };
       }

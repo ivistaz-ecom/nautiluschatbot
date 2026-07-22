@@ -173,12 +173,33 @@ async function requestLocalDocumentUpdate<T>(
     body: JSON.stringify(data),
   });
 
-  const payload = await res.json();
+  const raw = await res.text();
+  let payload: Record<string, unknown> = {};
+  if (raw.trim()) {
+    try {
+      payload = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      throw new ApiError(
+        `Update failed (invalid server response${res.status ? `, HTTP ${res.status}` : ''}).`,
+        res.status || 500
+      );
+    }
+  } else if (!res.ok) {
+    throw new ApiError(
+      `Update failed (empty response, HTTP ${res.status}). Deploy document-update.php on the PHP API host.`,
+      res.status || 500
+    );
+  }
+
   // 502 + local_only means metadata was saved locally but not to the live DB.
   if (res.ok || (res.status === 502 && payload?.local_only)) {
     return payload as T;
   }
-  throw new ApiError(payload.message || 'Update failed', res.status, payload.errors);
+  throw new ApiError(
+    String(payload.message || 'Update failed'),
+    res.status,
+    payload.errors as Record<string, string[]> | undefined
+  );
 }
 
 async function requestLocalAdminCategories(): Promise<{ data: Category[] }> {
