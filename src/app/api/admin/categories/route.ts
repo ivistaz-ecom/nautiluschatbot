@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { API_BACKEND_URL } from '@/lib/api-config';
 import { syncPendingDocumentOverrides } from '@/lib/document-update-sync';
-import { getDocumentOverrides } from '@/lib/document-overrides-store';
 
 export const dynamic = 'force-dynamic';
 
@@ -23,13 +22,13 @@ type DocRow = {
 };
 
 /**
- * Admin categories with accurate doc counts.
- * Also pushes any pending local document overrides to the live API first.
+ * Admin categories with doc counts from the LIVE database.
+ * Syncs pending local overrides to PHP first, then recounts from API docs
+ * (no local-only override inflation — keeps local and Vercel aligned).
  */
 export async function GET(req: NextRequest) {
   const auth = req.headers.get('authorization') || '';
 
-  // Flush local-only category edits to the live DB when possible.
   if (auth) {
     await syncPendingDocumentOverrides(auth);
   }
@@ -45,25 +44,11 @@ export async function GET(req: NextRequest) {
   }
 
   const categories: CategoryRow[] = Array.isArray(catPayload?.data) ? catPayload.data : [];
-
-  // Rebuild doc_count from live documents (+ any remaining local overrides).
   const docs = await fetchAllReadyDocs(auth);
-  const overrides = getDocumentOverrides();
 
   const counts = new Map<number, number>();
   for (const doc of docs) {
-    const id = Number(doc.id);
-    const ov = id ? overrides[String(id)] : null;
-    const categoryId = Number(ov?.category_id ?? doc.category_id ?? 0);
-    if (!categoryId) continue;
-    counts.set(categoryId, (counts.get(categoryId) || 0) + 1);
-  }
-
-  // Include override-only docs not present in the fetched page set (shouldn't happen often).
-  for (const [idStr, ov] of Object.entries(overrides)) {
-    const docId = Number(idStr);
-    if (docs.some((d) => Number(d.id) === docId)) continue;
-    const categoryId = Number(ov.category_id);
+    const categoryId = Number(doc.category_id ?? 0);
     if (!categoryId) continue;
     counts.set(categoryId, (counts.get(categoryId) || 0) + 1);
   }

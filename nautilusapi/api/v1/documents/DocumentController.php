@@ -285,9 +285,9 @@ class DocumentController {
 
     public function update(array $params): void {
         AuthMiddleware::requireAdmin();
-        $id = (int) ($params['id'] ?? 0);
+        $id = (int) ($params['id'] ?? Request::get('id') ?? 0);
 
-        if (!Database::queryOne('SELECT id FROM documents WHERE id = ?', [$id])) {
+        if ($id <= 0 || !Database::queryOne('SELECT id FROM documents WHERE id = ?', [$id])) {
             Response::error('Document not found', 404);
             return;
         }
