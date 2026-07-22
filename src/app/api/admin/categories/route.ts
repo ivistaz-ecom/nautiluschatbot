@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { API_BACKEND_URL } from '@/lib/api-config';
 import { syncPendingDocumentOverrides } from '@/lib/document-update-sync';
+import { getDocumentOverrides } from '@/lib/document-overrides-store';
+import { countReadyPdfsByCategory } from '@/lib/effective-document-categories';
 
 export const dynamic = 'force-dynamic';
 
@@ -18,13 +20,15 @@ type CategoryRow = {
 type DocRow = {
   id?: number;
   category_id?: number;
+  category_name?: string;
+  mime_type?: string;
+  original_filename?: string;
+  title?: string;
   status?: string;
 };
 
 /**
- * Admin categories with doc counts from the LIVE database.
- * Syncs pending local overrides to PHP first, then recounts from API docs
- * (no local-only override inflation — keeps local and Vercel aligned).
+ * Admin categories with doc counts that match Documents (including pending overrides).
  */
 export async function GET(req: NextRequest) {
   const auth = req.headers.get('authorization') || '';
@@ -45,21 +49,18 @@ export async function GET(req: NextRequest) {
 
   const categories: CategoryRow[] = Array.isArray(catPayload?.data) ? catPayload.data : [];
   const docs = await fetchAllReadyDocs(auth);
+  const overrides = getDocumentOverrides();
+  const counts = countReadyPdfsByCategory(docs, overrides);
 
-  const counts = new Map<number, number>();
-  for (const doc of docs) {
-    const categoryId = Number(doc.category_id ?? 0);
-    if (!categoryId) continue;
-    counts.set(categoryId, (counts.get(categoryId) || 0) + 1);
-  }
-
-  const data = categories.map((c) => ({
-    ...c,
-    id: Number(c.id),
-    doc_count: counts.has(Number(c.id))
-      ? counts.get(Number(c.id))
-      : Number(c.doc_count ?? 0),
-  }));
+  const data = categories.map((c) => {
+    const id = Number(c.id);
+    const counted = counts.get(id);
+    return {
+      ...c,
+      id,
+      doc_count: counted ? counted.count : 0,
+    };
+  });
 
   return NextResponse.json({ data });
 }

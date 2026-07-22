@@ -5,6 +5,8 @@ import {
   buildSuggestionBundle,
   fetchSuggestionInputs,
 } from '@/lib/query-suggestions';
+import { getDocumentOverrides } from '@/lib/document-overrides-store';
+import { documentIdsForCategories } from '@/lib/effective-document-categories';
 
 export const dynamic = 'force-dynamic';
 
@@ -26,6 +28,12 @@ function notFoundInSelectedCategoriesMessage(categoryIds: number[]): string {
     : 'The given question was not found in the selected categories.';
 }
 
+function sourceDocumentId(src: unknown): number {
+  if (!src || typeof src !== 'object') return 0;
+  const row = src as Record<string, unknown>;
+  return Number(row.document_id ?? row.fileId ?? 0);
+}
+
 function extractTopicHints(sources: unknown[]): string[] {
   const hints: string[] = [];
   for (const raw of sources) {
@@ -42,13 +50,40 @@ function extractTopicHints(sources: unknown[]): string[] {
   return hints;
 }
 
+async function fetchReadyDocs(auth: string): Promise<Array<{ id?: number; category_id?: number }>> {
+  try {
+    const res = await fetch(`${API_BACKEND_URL.replace(/\/$/, '')}/chat/documents?status=ready`, {
+      headers: auth ? { Authorization: auth } : {},
+      cache: 'no-store',
+    });
+    if (!res.ok) return [];
+    const json = await res.json();
+    return Array.isArray(json?.data) ? json.data : [];
+  } catch {
+    return [];
+  }
+}
+
 /**
  * Proxies POST /chat/ask to the PHP API, then recovers missed answers
  * and attaches exact PDF page citations + query suggestions when weak.
  */
 export async function POST(req: NextRequest) {
   const auth = req.headers.get('authorization') || '';
-  const body = await req.json();
+  const body = (await req.json()) as Record<string, unknown>;
+  const categoryIds = parseCategoryIds(body ?? {});
+
+  // Pending local category reassignments → include those document IDs in retrieval.
+  const askBody: Record<string, unknown> = { ...body };
+  let allowedDocumentIds: number[] | undefined;
+  if (categoryIds?.length) {
+    const docs = await fetchReadyDocs(auth);
+    const overrides = getDocumentOverrides();
+    allowedDocumentIds = documentIdsForCategories(categoryIds, docs, overrides);
+    if (allowedDocumentIds.length > 0) {
+      askBody.document_ids = allowedDocumentIds;
+    }
+  }
 
   const upstream = await fetch(`${API_BACKEND_URL}/chat/ask`, {
     method: 'POST',
@@ -56,7 +91,7 @@ export async function POST(req: NextRequest) {
       'Content-Type': 'application/json',
       ...(auth ? { Authorization: auth } : {}),
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify(askBody),
   });
 
   const payload = await upstream.json();
@@ -71,7 +106,6 @@ export async function POST(req: NextRequest) {
   }
 
   const question = typeof body?.question === 'string' ? body.question : '';
-  const categoryIds = parseCategoryIds(body ?? {});
   const answer = typeof data.answer === 'string' ? data.answer : '';
   const isAnswered = Boolean(data.is_answered);
   const rawSources = Array.isArray(data.sources) ? data.sources : [];
@@ -87,10 +121,21 @@ export async function POST(req: NextRequest) {
 
   // Enforce category scope: never return out-of-scope answers/sources.
   if (categoryIds) {
-    const scopedOk =
-      Boolean(resolved.is_answered) &&
-      Array.isArray(resolved.sources) &&
-      resolved.sources.length > 0;
+    let sources = Array.isArray(resolved.sources) ? resolved.sources : [];
+    if (allowedDocumentIds && allowedDocumentIds.length > 0) {
+      const allow = new Set(allowedDocumentIds);
+      sources = sources.filter((s) => {
+        const id = sourceDocumentId(s);
+        if (id && allow.has(id)) return true;
+        const cat = Number(
+          (s as { category_id?: number; categoryId?: number }).category_id ??
+            (s as { categoryId?: number }).categoryId ??
+            0
+        );
+        return cat > 0 && categoryIds.includes(cat);
+      });
+    }
+    const scopedOk = Boolean(resolved.is_answered) && sources.length > 0;
     if (!scopedOk) {
       data.answer = notFoundInSelectedCategoriesMessage(categoryIds);
       data.is_answered = false;
@@ -98,7 +143,7 @@ export async function POST(req: NextRequest) {
     } else {
       data.answer = resolved.answer;
       data.is_answered = true;
-      data.sources = resolved.sources;
+      data.sources = sources;
     }
   } else {
     data.answer = resolved.answer;

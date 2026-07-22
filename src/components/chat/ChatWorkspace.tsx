@@ -151,11 +151,10 @@ export function ChatWorkspace({ sessionId = null }: ChatWorkspaceProps) {
   }, [sessions, sessionSearch]);
 
   // Categories near the ask box: only those that currently have ready PDFs.
-  const categoriesWithPdfs = useMemo(() => {
-    const hasCounts = categories.some((c) => c.doc_count != null);
-    if (hasCounts) return categories.filter((c) => Number(c.doc_count) > 0);
-    return categories;
-  }, [categories]);
+  const categoriesWithPdfs = useMemo(
+    () => categories.filter((c) => Number(c.doc_count) > 0),
+    [categories]
+  );
 
   useEffect(() => {
     if (!authLoading && !user) router.replace('/login');

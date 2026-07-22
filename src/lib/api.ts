@@ -174,10 +174,11 @@ async function requestLocalDocumentUpdate<T>(
   });
 
   const payload = await res.json();
-  if (!res.ok) {
-    throw new ApiError(payload.message || 'Update failed', res.status, payload.errors);
+  // 502 + local_only means metadata was saved locally but not to the live DB.
+  if (res.ok || (res.status === 502 && payload?.local_only)) {
+    return payload as T;
   }
-  return payload as T;
+  throw new ApiError(payload.message || 'Update failed', res.status, payload.errors);
 }
 
 async function requestLocalAdminCategories(): Promise<{ data: Category[] }> {

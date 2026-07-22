@@ -1,6 +1,7 @@
 import { API_BACKEND_URL, DOCUMENT_API_URL } from './api-config';
 import { cachePdfPages, extractPdfPages, getCachedPdfPages } from './pdf-pages';
 import { synthesizeAnswerFromPassages } from './pdf-llm-answer';
+import { getDocumentOverrides } from './document-overrides-store';
 
 export type SourceLike = Record<string, unknown>;
 
@@ -972,22 +973,31 @@ export function mergeAssistantSources(
 
 async function listReadyPdfDocuments(auth: string, categoryIds?: number[]): Promise<ReadyPdfDoc[]> {
   const ids = normalizeCategoryIds(categoryIds);
+  const overrides = getDocumentOverrides();
 
   const mapDocs = (docs: Array<Record<string, unknown>>): ReadyPdfDoc[] => {
     const mapped = docs
-      .map((doc) => ({
-        id: Number(doc.id),
-        title: String(doc.title || doc.original_filename || 'Document'),
-        original_filename: doc.original_filename ? String(doc.original_filename) : undefined,
-        category_id: doc.category_id != null ? Number(doc.category_id) : undefined,
-        category_name: doc.category_name ? String(doc.category_name) : undefined,
-        mime: String(doc.mime_type || ''),
-        name: String(doc.original_filename || '').toLowerCase(),
-      }))
+      .map((doc) => {
+        const id = Number(doc.id);
+        const ov = id ? overrides[String(id)] : null;
+        return {
+          id,
+          title: String(ov?.title || doc.title || doc.original_filename || 'Document'),
+          original_filename: doc.original_filename ? String(doc.original_filename) : undefined,
+          category_id: Number(ov?.category_id ?? doc.category_id ?? 0) || undefined,
+          category_name: ov?.category_name || (doc.category_name ? String(doc.category_name) : undefined),
+          mime: String(doc.mime_type || ''),
+          name: String(doc.original_filename || '').toLowerCase(),
+        };
+      })
       .filter(
         (doc) =>
           doc.id > 0 &&
-          (doc.mime === 'application/pdf' || doc.name.endsWith('.pdf'))
+          (doc.mime.includes('pdf') ||
+            doc.name.endsWith('.pdf') ||
+            !doc.mime ||
+            doc.mime === 'application/octet-stream' ||
+            doc.mime === 'binary/octet-stream')
       )
       .map(({ id, title, original_filename, category_id, category_name }) => ({
         id,
@@ -1001,9 +1011,9 @@ async function listReadyPdfDocuments(auth: string, categoryIds?: number[]): Prom
     return mapped.filter((d) => d.category_id != null && ids.includes(Number(d.category_id)));
   };
 
+  // Always fetch the full ready list when filtering — local overrides may remapped
+  // category_id so PHP category_id query would miss those PDFs.
   const chatParams = new URLSearchParams({ status: 'ready' });
-  if (ids?.length === 1) chatParams.set('category_id', String(ids[0]));
-  else if (ids && ids.length > 1) chatParams.set('category_ids', ids.join(','));
 
   try {
     const res = await fetch(`${API_BACKEND_URL}/chat/documents?${chatParams}`, {
@@ -1027,7 +1037,6 @@ async function listReadyPdfDocuments(auth: string, categoryIds?: number[]): Prom
       per_page: '100',
       page: String(page),
     });
-    if (ids?.length === 1) params.set('category_id', String(ids[0]));
 
     try {
       const res = await fetch(`${API_BACKEND_URL}/admin/documents?${params}`, {
@@ -1047,10 +1056,6 @@ async function listReadyPdfDocuments(auth: string, categoryIds?: number[]): Prom
     }
   }
 
-  // When multi-select and admin only filtered one id, filter client-side.
-  if (ids && ids.length > 1) {
-    return all.filter((d) => d.category_id != null && ids.includes(Number(d.category_id)));
-  }
   return all;
 }
 
