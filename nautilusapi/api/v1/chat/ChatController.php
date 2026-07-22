@@ -458,6 +458,7 @@ class ChatController {
     public function categories(array $params = []): void {
         AuthMiddleware::require();
         // Only categories that currently have at least one ready PDF.
+        // Mime check matches the Next BFF: pdf mime, .pdf filename, or generic binary.
         $rows = Database::query(
             "SELECT c.id, c.name, c.slug, c.description, c.parent_id, c.sort_order,
                     (
@@ -466,8 +467,9 @@ class ChatController {
                       WHERE d.category_id = c.id
                         AND d.status = 'ready'
                         AND (
-                          d.mime_type = 'application/pdf'
-                          OR LOWER(d.original_filename) LIKE '%.pdf'
+                          d.mime_type LIKE '%pdf%'
+                          OR LOWER(IFNULL(d.original_filename, '')) LIKE '%.pdf'
+                          OR IFNULL(d.mime_type, '') IN ('', 'application/octet-stream', 'binary/octet-stream')
                         )
                     ) AS doc_count
              FROM categories c
@@ -477,8 +479,9 @@ class ChatController {
                WHERE d.category_id = c.id
                  AND d.status = 'ready'
                  AND (
-                   d.mime_type = 'application/pdf'
-                   OR LOWER(d.original_filename) LIKE '%.pdf'
+                   d.mime_type LIKE '%pdf%'
+                   OR LOWER(IFNULL(d.original_filename, '')) LIKE '%.pdf'
+                   OR IFNULL(d.mime_type, '') IN ('', 'application/octet-stream', 'binary/octet-stream')
                  )
              )
              ORDER BY c.sort_order ASC, c.name ASC"
