@@ -67,6 +67,51 @@ const CATEGORY_PILL_TONES = [
   { idle: 'border-blue-400/50 text-blue-300', active: 'bg-blue-400/20 border-blue-300 text-blue-100' },
 ] as const;
 
+const ASK_STATUS_STEPS = [
+  'Searching manuals…',
+  'Finding relevant pages…',
+  'Preparing your answer…',
+] as const;
+
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+/** ChatGPT-style reveal: stream words so the wait feels shorter after the API returns. */
+async function streamAnswerText(
+  full: string,
+  onChunk: (partial: string) => void,
+  isCancelled?: () => boolean
+): Promise<void> {
+  if (!full) {
+    onChunk('');
+    return;
+  }
+  if (full.length < 48) {
+    onChunk(full);
+    return;
+  }
+
+  const tokens = full.split(/(\s+)/);
+  const wordCount = tokens.filter((t) => t.trim()).length || 1;
+  const targetMs = Math.min(3200, Math.max(900, full.length * 7));
+  const delay = Math.max(10, Math.floor(targetMs / wordCount));
+
+  let out = '';
+  for (const token of tokens) {
+    if (isCancelled?.()) {
+      onChunk(full);
+      return;
+    }
+    out += token;
+    onChunk(out);
+    if (token.trim()) await sleep(delay);
+  }
+  onChunk(full);
+}
+
 export function normalizeSessionId(id: string | number | null | undefined): string {
   return id == null ? '' : String(id);
 }
@@ -89,6 +134,8 @@ export function ChatWorkspace({ sessionId = null }: ChatWorkspaceProps) {
   const [categoriesLoading, setCategoriesLoading] = useState(true);
   const [question, setQuestion] = useState('');
   const [asking, setAsking] = useState(false);
+  const [askStatus, setAskStatus] = useState<string>(ASK_STATUS_STEPS[0]);
+  const [streamingId, setStreamingId] = useState<string | null>(null);
   const [loadingSession, setLoadingSession] = useState(Boolean(activeSession));
   const [selectedCats, setSelectedCats] = useState<number[]>([]);
   const [showFaqs, setShowFaqs] = useState(false);
@@ -113,6 +160,18 @@ export function ChatWorkspace({ sessionId = null }: ChatWorkspaceProps) {
   useEffect(() => {
     if (!authLoading && !user) router.replace('/login');
   }, [user, authLoading, router]);
+
+  // Rotate status copy while the API is working (before answer streaming starts).
+  useEffect(() => {
+    if (!asking || streamingId) return;
+    let step = 0;
+    setAskStatus(ASK_STATUS_STEPS[0]);
+    const timer = setInterval(() => {
+      step = Math.min(step + 1, ASK_STATUS_STEPS.length - 1);
+      setAskStatus(ASK_STATUS_STEPS[step]);
+    }, 2400);
+    return () => clearInterval(timer);
+  }, [asking, streamingId]);
 
   useEffect(() => {
     if (!user) return;
@@ -209,8 +268,10 @@ export function ChatWorkspace({ sessionId = null }: ChatWorkspaceProps) {
   }, [user, activeSession]);
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+    bottomRef.current?.scrollIntoView({
+      behavior: streamingId ? 'auto' : 'smooth',
+    });
+  }, [messages, asking, askStatus, streamingId]);
 
   async function loadSessions() {
     try {
@@ -261,6 +322,8 @@ export function ChatWorkspace({ sessionId = null }: ChatWorkspaceProps) {
 
     setQuestion('');
     setAsking(true);
+    setStreamingId(null);
+    setAskStatus(ASK_STATUS_STEPS[0]);
 
     const tempId = newMessageId('temp');
     setMessages((prev) => [
@@ -275,28 +338,52 @@ export function ChatWorkspace({ sessionId = null }: ChatWorkspaceProps) {
       } as ChatMessage,
     ]);
 
+    let cancelled = false;
+    let assistantIdForCleanup: string | null = null;
     try {
       const r = await api.chat.ask(
         text,
         activeSession ?? undefined,
         selectedCats.length > 0 ? selectedCats : undefined
       );
-      const { session_id, message_id, answer, sources, is_answered } = r.data;
+      const {
+        session_id,
+        message_id,
+        answer,
+        sources,
+        is_answered,
+        did_you_mean,
+        looking_for,
+        suggestions,
+      } = r.data;
       const sid = normalizeSessionId(activeSession ?? session_id);
       const isNew = !activeSession;
 
       const enrichedSources = Array.isArray(sources) ? [...sources] : [];
+      const lookingFor = Array.isArray(looking_for)
+        ? looking_for
+        : Array.isArray(suggestions)
+          ? suggestions
+          : [];
+      const fullAnswer = typeof answer === 'string' ? answer : '';
+      const answeredFlag = is_answered || enrichedSources.length > 0 ? 1 : 0;
+      const assistantId = String(message_id);
+      assistantIdForCleanup = assistantId;
+
       if (is_answered || enrichedSources.length > 0) {
-        cacheAssistantTurn(String(message_id), {
-          answer,
+        cacheAssistantTurn(assistantId, {
+          answer: fullAnswer,
           is_answered: Boolean(is_answered) || enrichedSources.length > 0,
           sources: enrichedSources,
         });
       }
 
+      // Insert assistant shell, then stream the text (ChatGPT-style).
+      setAskStatus('Writing your answer…');
+      setStreamingId(assistantId);
       setMessages((prev) => {
         const withoutTemp = prev.filter((m) => m.id !== tempId);
-        const updated: ChatMessage[] = [
+        return [
           ...withoutTemp,
           {
             id: newMessageId('user'),
@@ -306,15 +393,44 @@ export function ChatWorkspace({ sessionId = null }: ChatWorkspaceProps) {
             created_at: new Date().toISOString(),
           } as ChatMessage,
           {
-            id: String(message_id),
+            id: assistantId,
             session_id: sid,
             role: 'assistant',
-            answer,
-            sources: enrichedSources,
-            is_answered: is_answered || enrichedSources.length > 0 ? 1 : 0,
+            answer: '',
+            sources: [],
+            is_answered: answeredFlag,
+            did_you_mean: null,
+            looking_for: [],
+            suggestions: [],
             created_at: new Date().toISOString(),
           } as ChatMessage,
         ];
+      });
+
+      await streamAnswerText(
+        fullAnswer,
+        (partial) => {
+          setMessages((prev) =>
+            prev.map((m) => (m.id === assistantId ? { ...m, answer: partial } : m))
+          );
+        },
+        () => cancelled
+      );
+
+      setMessages((prev) => {
+        const updated = prev.map((m) =>
+          m.id === assistantId
+            ? {
+                ...m,
+                answer: fullAnswer,
+                sources: enrichedSources,
+                is_answered: answeredFlag,
+                did_you_mean: did_you_mean || null,
+                looking_for: lookingFor,
+                suggestions: lookingFor,
+              }
+            : m
+        );
         cacheSessionMessages(sid, updated);
         return updated;
       });
@@ -328,9 +444,10 @@ export function ChatWorkspace({ sessionId = null }: ChatWorkspaceProps) {
 
       if (!is_answered) loadFaqs(selectedCats.length === 1 ? selectedCats[0] : undefined);
     } catch (err: unknown) {
+      cancelled = true;
       const msg = err instanceof Error ? err.message : 'Something went wrong';
       setMessages((prev) => [
-        ...prev.filter((m) => m.id !== tempId),
+        ...prev.filter((m) => m.id !== tempId && m.id !== assistantIdForCleanup),
         {
           id: newMessageId('error'),
           session_id: '',
@@ -341,6 +458,7 @@ export function ChatWorkspace({ sessionId = null }: ChatWorkspaceProps) {
         } as ChatMessage,
       ]);
     } finally {
+      setStreamingId(null);
       setAsking(false);
     }
   }
@@ -528,28 +646,39 @@ export function ChatWorkspace({ sessionId = null }: ChatWorkspaceProps) {
           )}
 
           {messages.map((msg) => (
-            <MessageBubble key={msg.id} msg={msg} />
+            <MessageBubble
+              key={msg.id}
+              msg={msg}
+              isStreaming={streamingId === msg.id}
+              onSuggest={(q) => sendQuestion(q)}
+              suggestingDisabled={asking}
+            />
           ))}
 
-          {asking && !loadingSession && (
+          {asking && !streamingId && !loadingSession && (
             <div className="flex gap-3">
               <div className="w-8 h-8 bg-white/20 rounded-full flex items-center justify-center flex-shrink-0 overflow-hidden">
                 <img src="/white-logo.webp" alt="" className="w-5 h-5 object-contain" />
               </div>
-              <div className="bg-brand-light border border-white/10 rounded-2xl rounded-tl-none px-4 py-3">
-                <div className="flex gap-1 items-center h-5">
-                  <span
-                    className="w-2 h-2 bg-white/40 rounded-full animate-bounce"
-                    style={{ animationDelay: '0ms' }}
-                  />
-                  <span
-                    className="w-2 h-2 bg-white/40 rounded-full animate-bounce"
-                    style={{ animationDelay: '150ms' }}
-                  />
-                  <span
-                    className="w-2 h-2 bg-white/40 rounded-full animate-bounce"
-                    style={{ animationDelay: '300ms' }}
-                  />
+              <div className="bg-brand-light border border-white/10 rounded-2xl rounded-tl-none px-4 py-3 min-w-[12rem]">
+                <div className="flex items-center gap-2.5">
+                  <div className="flex gap-1 items-center h-4">
+                    <span
+                      className="w-1.5 h-1.5 bg-brand-accent/80 rounded-full animate-bounce"
+                      style={{ animationDelay: '0ms' }}
+                    />
+                    <span
+                      className="w-1.5 h-1.5 bg-brand-accent/80 rounded-full animate-bounce"
+                      style={{ animationDelay: '150ms' }}
+                    />
+                    <span
+                      className="w-1.5 h-1.5 bg-brand-accent/80 rounded-full animate-bounce"
+                      style={{ animationDelay: '300ms' }}
+                    />
+                  </div>
+                  <p className="text-sm text-white/70 transition-opacity duration-300">
+                    {askStatus}
+                  </p>
                 </div>
               </div>
             </div>
@@ -666,7 +795,17 @@ function SessionSkeleton() {
   );
 }
 
-function MessageBubble({ msg }: { msg: ChatMessage }) {
+function MessageBubble({
+  msg,
+  isStreaming = false,
+  onSuggest,
+  suggestingDisabled = false,
+}: {
+  msg: ChatMessage;
+  isStreaming?: boolean;
+  onSuggest?: (question: string) => void;
+  suggestingDisabled?: boolean;
+}) {
   const [submitDone, setSubmitDone] = useState(false);
 
   if (msg.role === 'user') {
@@ -679,6 +818,14 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
     );
   }
 
+  const didYouMean = msg.did_you_mean?.trim() || null;
+  const lookingFor = (msg.looking_for?.length ? msg.looking_for : msg.suggestions || [])
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .filter((s) => s.toLowerCase() !== (didYouMean || '').toLowerCase())
+    .slice(0, 4);
+  const showSuggestions = Boolean(didYouMean || lookingFor.length > 0) && !isStreaming;
+
   return (
     <div className="flex gap-3">
       <div className="w-8 h-8 bg-white/20 rounded-full flex items-center justify-center flex-shrink-0 overflow-hidden">
@@ -687,12 +834,12 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
       <div className="flex-1 max-w-2xl space-y-2">
         <div
           className={`rounded-2xl rounded-tl-none px-4 py-3 text-sm border ${
-            msg.is_answered === 0
+            msg.is_answered === 0 && !isStreaming
               ? 'bg-amber-500/10 border-amber-500/30'
               : 'bg-brand-light border-white/10'
           }`}
         >
-          {msg.is_answered === 0 && (
+          {msg.is_answered === 0 && !isStreaming && (
             <div className="flex items-center gap-1.5 text-amber-300 text-xs font-medium mb-2">
               <AlertTriangle className="w-3.5 h-3.5" />
               {/selected categor/i.test(msg.answer || '')
@@ -700,10 +847,58 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
                 : 'Not found in documents'}
             </div>
           )}
-          <p className="text-white/90 leading-relaxed whitespace-pre-wrap">{msg.answer}</p>
+          <p className="text-white/90 leading-relaxed whitespace-pre-wrap">
+            {msg.answer}
+            {isStreaming && (
+              <span
+                className="inline-block w-1.5 h-4 ml-0.5 align-text-bottom bg-brand-accent/90 animate-pulse"
+                aria-hidden
+              />
+            )}
+          </p>
         </div>
 
-        {msg.sources && msg.sources.length > 0 && (
+        {showSuggestions && onSuggest && (
+          <div className="rounded-xl border border-white/15 bg-white/5 px-3 py-2.5 space-y-2">
+            {didYouMean && (
+              <div className="space-y-1.5">
+                <p className="text-[11px] font-medium uppercase tracking-wide text-white/45">
+                  Did you mean
+                </p>
+                <button
+                  type="button"
+                  disabled={suggestingDisabled}
+                  onClick={() => onSuggest(didYouMean)}
+                  className="text-left text-sm text-brand-accent hover:underline disabled:opacity-50"
+                >
+                  {didYouMean}
+                </button>
+              </div>
+            )}
+            {lookingFor.length > 0 && (
+              <div className="space-y-1.5">
+                <p className="text-[11px] font-medium uppercase tracking-wide text-white/45">
+                  Are you looking for
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  {lookingFor.map((s) => (
+                    <button
+                      key={s}
+                      type="button"
+                      disabled={suggestingDisabled}
+                      onClick={() => onSuggest(s)}
+                      className="rounded-full border border-white/20 bg-white/5 px-3 py-1 text-xs text-white/85 hover:bg-white/15 hover:border-white/35 transition-colors disabled:opacity-50"
+                    >
+                      {s}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {!isStreaming && msg.sources && msg.sources.length > 0 && (
           <div className="space-y-1.5">
             <p className="text-[11px] font-medium uppercase tracking-wide text-white/40">
               Sources
@@ -719,10 +914,10 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
           </div>
         )}
 
-        {msg.is_answered === 0 && !submitDone && (
+        {!isStreaming && msg.is_answered === 0 && !submitDone && (
           <button
             onClick={async () => {
-              await api.chat.submitQuery(msg.answer ?? '');
+              await api.chat.submitQuery(msg.question ?? msg.answer ?? '');
               setSubmitDone(true);
             }}
             className="text-xs text-brand-accent hover:underline flex items-center gap-1"
@@ -738,9 +933,11 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
           </p>
         )}
 
-        <p className="text-xs text-white/30">
-          {new Date(msg.created_at).toLocaleTimeString()}
-        </p>
+        {!isStreaming && (
+          <p className="text-xs text-white/30">
+            {new Date(msg.created_at).toLocaleTimeString()}
+          </p>
+        )}
       </div>
     </div>
   );
