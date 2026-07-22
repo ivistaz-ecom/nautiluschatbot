@@ -42,6 +42,7 @@ class ChatController {
         $question     = trim(strip_tags(Request::post('question')));
         $sessionId    = Request::post('session_id');
         $categoryIds  = $this->parseCategoryIdsFromRequest(true);
+        $documentIds  = $this->parseDocumentIdsFromRequest(true);
         $userScoped   = $categoryIds !== null && count($categoryIds) > 0;
         // Single id kept for FAQ / message persistence columns.
         $categoryId   = $categoryIds && count($categoryIds) === 1 ? $categoryIds[0] : null;
@@ -83,7 +84,7 @@ class ChatController {
 
         if ($faq && $faq['ask_count'] >= $cfg['faq']['cache_threshold'] && $faq['canonical_answer']) {
             // Cached answer — still attach PDF sources from retrieval so cards always render.
-            $retrieval = $this->retrieveChunks($question, $categoryIds, $cfg['llm']['context_chunks']);
+            $retrieval = $this->retrieveChunks($question, $categoryIds, $cfg['llm']['context_chunks'], $documentIds);
             $cachedSources = SourceAttributor::ensureNonEmptySources(
                 [],
                 $retrieval['for_llm'] ?? [],
@@ -137,7 +138,7 @@ class ChatController {
         }
 
         // ── Step 3: Retrieve relevant document chunks ─────────────
-        $retrieval = $this->retrieveChunks($question, $categoryIds, $cfg['llm']['context_chunks']);
+        $retrieval = $this->retrieveChunks($question, $categoryIds, $cfg['llm']['context_chunks'], $documentIds);
         $chunks    = $retrieval['for_llm'];
         $allChunks = $retrieval['for_fallback'];
 
@@ -681,39 +682,82 @@ class ChatController {
 
     /**
      * @param array<int>|null $categoryIds
+     * @param array<int>|null $documentIds  Extra docs to include (e.g. pending category reassignments)
      * @return array{0: string, 1: array<int>}
      */
-    private function categoryFilterSql(?array $categoryIds): array {
-        if (!$categoryIds || count($categoryIds) === 0) {
+    private function categoryFilterSql(?array $categoryIds, ?array $documentIds = null): array {
+        $parts = [];
+        $binds = [];
+
+        if ($categoryIds && count($categoryIds) > 0) {
+            $placeholders = implode(',', array_fill(0, count($categoryIds), '?'));
+            $parts[] = "d.category_id IN ($placeholders)";
+            foreach ($categoryIds as $id) {
+                $binds[] = (int) $id;
+            }
+        }
+
+        if ($documentIds && count($documentIds) > 0) {
+            $placeholders = implode(',', array_fill(0, count($documentIds), '?'));
+            $parts[] = "d.id IN ($placeholders)";
+            foreach ($documentIds as $id) {
+                $binds[] = (int) $id;
+            }
+        }
+
+        if (empty($parts)) {
             return ['', []];
         }
-        $placeholders = implode(',', array_fill(0, count($categoryIds), '?'));
-        return ["AND d.category_id IN ($placeholders)", $categoryIds];
+
+        return ['AND (' . implode(' OR ', $parts) . ')', $binds];
+    }
+
+    /** @return array<int>|null */
+    private function parseDocumentIdsFromRequest(bool $fromPost = true): ?array {
+        $raw = $fromPost ? Request::post('document_ids') : Request::get('document_ids');
+        $ids = [];
+        if (is_array($raw)) {
+            foreach ($raw as $v) {
+                $n = (int) $v;
+                if ($n > 0) {
+                    $ids[] = $n;
+                }
+            }
+        } elseif (is_string($raw) && $raw !== '') {
+            foreach (explode(',', $raw) as $part) {
+                $n = (int) trim($part);
+                if ($n > 0) {
+                    $ids[] = $n;
+                }
+            }
+        }
+        $ids = array_values(array_unique($ids));
+        return count($ids) > 0 ? $ids : null;
     }
 
     /**
      * @return array{for_llm: array<int, array<string, mixed>>, for_fallback: array<int, array<string, mixed>>}
      */
-    private function retrieveChunks(string $question, ?array $categoryIds, int $limit): array {
+    private function retrieveChunks(string $question, ?array $categoryIds, int $limit, ?array $documentIds = null): array {
         $limit      = max(1, $limit);
         // Fetch extra candidates so reranking can promote substantive pages over TOC hits.
         $fetchLimit = min($limit * 3, 24);
         $terms      = $this->extractSearchTerms($question);
 
-        $chunks = $this->searchChunks($terms['natural'], $categoryIds, $fetchLimit, 'natural');
+        $chunks = $this->searchChunks($terms['natural'], $categoryIds, $fetchLimit, 'natural', $documentIds);
 
         // Prefer required-term boolean (+word) so one common word cannot dominate.
         if (empty($chunks) && ($terms['required'] ?? '') !== '') {
-            $chunks = $this->searchChunks($terms['required'], $categoryIds, $fetchLimit, 'boolean');
+            $chunks = $this->searchChunks($terms['required'], $categoryIds, $fetchLimit, 'boolean', $documentIds);
         }
 
         if (empty($chunks) && $terms['boolean'] !== '') {
-            $chunks = $this->searchChunks($terms['boolean'], $categoryIds, $fetchLimit, 'boolean');
+            $chunks = $this->searchChunks($terms['boolean'], $categoryIds, $fetchLimit, 'boolean', $documentIds);
         }
 
         // Typo-tolerant pass: prefix wildcards recover misspelled words.
         if (empty($chunks) && ($terms['fuzzy'] ?? '') !== '' && $terms['fuzzy'] !== $terms['boolean']) {
-            $chunks = $this->searchChunks($terms['fuzzy'], $categoryIds, $fetchLimit, 'boolean');
+            $chunks = $this->searchChunks($terms['fuzzy'], $categoryIds, $fetchLimit, 'boolean', $documentIds);
             if (!empty($chunks)) {
                 Logger::info('[retrieval] fuzzy prefix search matched after exact search failed');
             }
@@ -721,11 +765,11 @@ class ChatController {
 
         // LIKE: AND first (precise), then OR only as last resort.
         if (empty($chunks) && !empty($terms['keywords'])) {
-            $chunks = $this->likeSearchChunks($terms['keywords'], $categoryIds, $fetchLimit, 'and');
+            $chunks = $this->likeSearchChunks($terms['keywords'], $categoryIds, $fetchLimit, 'and', $documentIds);
         }
 
         if (empty($chunks) && !empty($terms['keywords'])) {
-            $chunks = $this->likeSearchChunks($terms['keywords'], $categoryIds, $fetchLimit, 'or');
+            $chunks = $this->likeSearchChunks($terms['keywords'], $categoryIds, $fetchLimit, 'or', $documentIds);
         }
 
         // LIKE with typo-tolerant prefixes as the final lexical fallback.
@@ -734,9 +778,9 @@ class ChatController {
                 fn($w) => strlen($w) >= 6 ? substr($w, 0, max(4, strlen($w) - 3)) : $w,
                 $terms['keywords']
             );
-            $chunks = $this->likeSearchChunks($prefixes, $categoryIds, $fetchLimit, 'and');
+            $chunks = $this->likeSearchChunks($prefixes, $categoryIds, $fetchLimit, 'and', $documentIds);
             if (empty($chunks)) {
-                $chunks = $this->likeSearchChunks($prefixes, $categoryIds, $fetchLimit, 'or');
+                $chunks = $this->likeSearchChunks($prefixes, $categoryIds, $fetchLimit, 'or', $documentIds);
             }
         }
 
@@ -887,13 +931,13 @@ class ChatController {
         ];
     }
 
-    private function searchChunks(string $expr, ?array $categoryIds, int $limit, string $mode): array {
+    private function searchChunks(string $expr, ?array $categoryIds, int $limit, string $mode, ?array $documentIds = null): array {
         if ($expr === '') {
             return [];
         }
 
         $modeSql     = $mode === 'boolean' ? 'BOOLEAN MODE' : 'NATURAL LANGUAGE MODE';
-        [$categorySql, $categoryBinds] = $this->categoryFilterSql($categoryIds);
+        [$categorySql, $categoryBinds] = $this->categoryFilterSql($categoryIds, $documentIds);
         $binds       = array_merge([$expr, $expr], $categoryBinds);
         $binds[] = $limit;
 
@@ -921,7 +965,7 @@ class ChatController {
     /**
      * @param 'and'|'or' $mode
      */
-    private function likeSearchChunks(array $keywords, ?array $categoryIds, int $limit, string $mode = 'and'): array {
+    private function likeSearchChunks(array $keywords, ?array $categoryIds, int $limit, string $mode = 'and', ?array $documentIds = null): array {
         $likes = [];
         $binds = [];
 
@@ -945,7 +989,7 @@ class ChatController {
             $binds = array_slice($binds, 0, 3);
         }
 
-        [$categorySql, $categoryBinds] = $this->categoryFilterSql($categoryIds);
+        [$categorySql, $categoryBinds] = $this->categoryFilterSql($categoryIds, $documentIds);
         foreach ($categoryBinds as $b) {
             $binds[] = $b;
         }

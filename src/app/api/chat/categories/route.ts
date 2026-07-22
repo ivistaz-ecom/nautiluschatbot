@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { API_BACKEND_URL } from '@/lib/api-config';
 import { syncPendingDocumentOverrides } from '@/lib/document-update-sync';
+import { getDocumentOverrides } from '@/lib/document-overrides-store';
+import { countReadyPdfsByCategory } from '@/lib/effective-document-categories';
 
 export const dynamic = 'force-dynamic';
 
@@ -24,19 +26,6 @@ type DocRow = {
   status?: string;
 };
 
-function isReadyPdf(doc: DocRow): boolean {
-  const status = String(doc.status || 'ready').toLowerCase();
-  if (status && status !== 'ready') return false;
-  const mime = String(doc.mime_type || '').toLowerCase();
-  const name = String(doc.original_filename || doc.title || '').toLowerCase();
-  if (mime.includes('pdf') || name.endsWith('.pdf')) return true;
-  // Some uploads store generic binary mime — treat as PDF if no other type is set.
-  if (!mime || mime === 'application/octet-stream' || mime === 'binary/octet-stream') {
-    return true;
-  }
-  return false;
-}
-
 async function fetchJson(url: string, auth: string): Promise<unknown | null> {
   try {
     const res = await fetch(url, {
@@ -53,7 +42,6 @@ async function fetchJson(url: string, auth: string): Promise<unknown | null> {
 async function fetchAllReadyDocuments(auth: string): Promise<DocRow[]> {
   const all: DocRow[] = [];
 
-  // Prefer chat/documents (full list, no pagination).
   const chatPayload = await fetchJson(
     `${API_BACKEND_URL}/chat/documents?status=ready`,
     auth
@@ -84,28 +72,10 @@ async function fetchAllReadyDocuments(auth: string): Promise<DocRow[]> {
   return all;
 }
 
-function normalizeCategories(rows: CategoryRow[]): CategoryRow[] {
-  return rows
-    .map((c) => ({
-      ...c,
-      id: Number(c.id),
-      doc_count: c.doc_count != null ? Number(c.doc_count) : undefined,
-      sort_order: c.sort_order != null ? Number(c.sort_order) : 0,
-    }))
-    .filter((c) => c.id > 0)
-    .sort(
-      (a, b) =>
-        (a.sort_order ?? 0) - (b.sort_order ?? 0) || a.name.localeCompare(b.name)
-    );
-}
-
 /**
- * Categories with at least one ready PDF — from the LIVE database only.
- *
- * Local filesystem overrides are intentionally NOT applied here, so local
- * Next.js and Vercel both show the same pills for the same API/DB.
- *
- * Pending overrides are still synced to PHP first when possible.
+ * Categories that currently have ≥1 ready PDF.
+ * Uses live documents + pending local overrides so Admin Documents edits
+ * show up in chat pills even before the PHP update endpoint is deployed.
  */
 export async function GET(req: NextRequest) {
   const auth = req.headers.get('authorization') || '';
@@ -114,27 +84,15 @@ export async function GET(req: NextRequest) {
     await syncPendingDocumentOverrides(auth);
   }
 
-  // 1) Prefer PHP chat/categories (already filtered to ready PDFs).
-  const chatPayload = await fetchJson(`${API_BACKEND_URL}/chat/categories`, auth);
-  const chatCats = Array.isArray((chatPayload as { data?: CategoryRow[] } | null)?.data)
-    ? (chatPayload as { data: CategoryRow[] }).data
-    : [];
-
-  if (chatCats.length > 0) {
-    const normalized = normalizeCategories(chatCats).filter(
-      (c) => c.doc_count == null || Number(c.doc_count) > 0
-    );
-    if (normalized.length > 0) {
-      return NextResponse.json({ data: normalized });
-    }
-  }
-
-  // 2) Fallback: rebuild from live documents (no local override remapping).
-  const [adminCatPayload, docs] = await Promise.all([
+  const [catPayload, adminCatPayload, docs] = await Promise.all([
+    fetchJson(`${API_BACKEND_URL}/chat/categories`, auth),
     fetchJson(`${API_BACKEND_URL}/admin/categories`, auth),
     fetchAllReadyDocuments(auth),
   ]);
 
+  const chatCats = Array.isArray((catPayload as { data?: CategoryRow[] } | null)?.data)
+    ? (catPayload as { data: CategoryRow[] }).data
+    : [];
   const adminCats = Array.isArray((adminCatPayload as { data?: CategoryRow[] } | null)?.data)
     ? (adminCatPayload as { data: CategoryRow[] }).data
     : [];
@@ -146,19 +104,11 @@ export async function GET(req: NextRequest) {
     byId.set(id, { ...byId.get(id), ...c, id });
   }
 
-  const pdfCounts = new Map<number, { count: number; name?: string }>();
-  for (const doc of docs) {
-    if (!isReadyPdf(doc)) continue;
-    const categoryId = Number(doc.category_id);
-    if (!categoryId) continue;
-    const prev = pdfCounts.get(categoryId);
-    pdfCounts.set(categoryId, {
-      count: (prev?.count || 0) + 1,
-      name: prev?.name || (doc.category_name ? String(doc.category_name) : undefined),
-    });
-  }
+  const overrides = getDocumentOverrides();
+  const pdfCounts = countReadyPdfsByCategory(docs, overrides);
 
   const result = Array.from(pdfCounts.entries())
+    .filter(([, { count }]) => count > 0)
     .map(([id, { count, name }]) => {
       const existing = byId.get(id);
       return {

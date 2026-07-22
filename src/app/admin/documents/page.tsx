@@ -156,11 +156,11 @@ export default function AdminDocuments() {
       });
 
       closeEdit();
-      load();
+      await load();
+      api.admin.categories.list().then((r) => setCats(r.data)).catch(() => {});
       if ((res as { local_only?: boolean }).local_only) {
         setSuccessMessage(
-          (res as { message?: string }).message ||
-            'Saved locally only — live category counts/chat may not update until the PHP update endpoint is deployed.'
+          'Saved on this computer only. Live DB was not updated — deploy document-update.php (or latest DocumentController), then edit again. Category counts/chat use this local save for now.'
         );
       } else {
         setSuccessMessage('Document updated successfully.');
