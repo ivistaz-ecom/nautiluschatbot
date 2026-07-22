@@ -43,6 +43,7 @@ Rules:
 - When excerpts only point to another procedure, explain what this document says and name the referenced procedure — do not invent missing steps.
 - Do NOT dump document headers or page labels; you may restate list-item substance in plain prose.
 - Do NOT start with "According to" or cite source numbers in the answer text.
+- Never stitch unrelated keyword hits into a fake answer.
 - If the excerpts do not contain the answer, return:
 {"answer": "I could not find this information in the available documents.", "usedSources": []}
 

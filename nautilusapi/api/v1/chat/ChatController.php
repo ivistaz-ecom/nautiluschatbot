@@ -699,6 +699,11 @@ class ChatController {
 
         $chunks = $this->searchChunks($terms['natural'], $categoryIds, $fetchLimit, 'natural');
 
+        // Prefer required-term boolean (+word) so one common word cannot dominate.
+        if (empty($chunks) && ($terms['required'] ?? '') !== '') {
+            $chunks = $this->searchChunks($terms['required'], $categoryIds, $fetchLimit, 'boolean');
+        }
+
         if (empty($chunks) && $terms['boolean'] !== '') {
             $chunks = $this->searchChunks($terms['boolean'], $categoryIds, $fetchLimit, 'boolean');
         }
@@ -711,8 +716,13 @@ class ChatController {
             }
         }
 
+        // LIKE: AND first (precise), then OR only as last resort.
         if (empty($chunks) && !empty($terms['keywords'])) {
-            $chunks = $this->likeSearchChunks($terms['keywords'], $categoryIds, $fetchLimit);
+            $chunks = $this->likeSearchChunks($terms['keywords'], $categoryIds, $fetchLimit, 'and');
+        }
+
+        if (empty($chunks) && !empty($terms['keywords'])) {
+            $chunks = $this->likeSearchChunks($terms['keywords'], $categoryIds, $fetchLimit, 'or');
         }
 
         // LIKE with typo-tolerant prefixes as the final lexical fallback.
@@ -721,7 +731,10 @@ class ChatController {
                 fn($w) => strlen($w) >= 6 ? substr($w, 0, max(4, strlen($w) - 3)) : $w,
                 $terms['keywords']
             );
-            $chunks = $this->likeSearchChunks($prefixes, $categoryIds, $fetchLimit);
+            $chunks = $this->likeSearchChunks($prefixes, $categoryIds, $fetchLimit, 'and');
+            if (empty($chunks)) {
+                $chunks = $this->likeSearchChunks($prefixes, $categoryIds, $fetchLimit, 'or');
+            }
         }
 
         $chunks = $this->filterUsefulChunks($chunks);
@@ -735,10 +748,14 @@ class ChatController {
             fn($c) => !DocumentParser::isTableOfContentsChunk($c['content'] ?? '')
         ));
 
-        // Re-rank: boost explanatory paragraphs, penalise any remaining index-like text.
+        // Re-rank: boost on-topic explanatory paragraphs, penalise keyword-only pages.
         $reranker = new ChunkReranker();
         $forFallback = $reranker->rerank($forFallback, $question);
         $chunks      = $reranker->rerank($chunks, $question);
+
+        // Drop weak topic overlap before the LLM sees the context.
+        $forFallback = $reranker->filterWeakTopicChunks($forFallback, $question);
+        $chunks      = $reranker->filterWeakTopicChunks($chunks, $question);
 
         $forLlm = array_slice($chunks, 0, $limit);
         $forFallback = array_slice($forFallback, 0, $limit);
@@ -841,12 +858,19 @@ class ChatController {
 
         $significant = array_values(array_unique($significant));
         $top         = array_slice($significant, 0, 12);
+        // Require the strongest topic words so one generic term cannot flood results.
+        $requiredWords = array_slice($top, 0, min(4, max(2, count($top))));
 
         return [
             'natural'  => implode(' ', $top),
             'boolean'  => implode(' ', array_map(
                 fn($w) => strlen($w) >= 3 ? $w . '*' : $w,
                 $top
+            )),
+            // Required boolean: each significant word must appear (+term*).
+            'required' => implode(' ', array_map(
+                fn($w) => strlen($w) >= 3 ? '+' . $w . '*' : '+' . $w,
+                $requiredWords
             )),
             // Typo-tolerant boolean pass: prefix wildcards so a misspelled
             // ending ("proceduer") still matches the indexed word ("procedure").
@@ -867,7 +891,7 @@ class ChatController {
 
         $modeSql     = $mode === 'boolean' ? 'BOOLEAN MODE' : 'NATURAL LANGUAGE MODE';
         [$categorySql, $categoryBinds] = $this->categoryFilterSql($categoryIds);
-        $binds       = [$expr, $expr, ...$categoryBinds];
+        $binds       = array_merge([$expr, $expr], $categoryBinds);
         $binds[] = $limit;
 
         try {
@@ -891,7 +915,10 @@ class ChatController {
         }
     }
 
-    private function likeSearchChunks(array $keywords, ?array $categoryIds, int $limit): array {
+    /**
+     * @param 'and'|'or' $mode
+     */
+    private function likeSearchChunks(array $keywords, ?array $categoryIds, int $limit, string $mode = 'and'): array {
         $likes = [];
         $binds = [];
 
@@ -907,6 +934,14 @@ class ChatController {
             return [];
         }
 
+        // Prefer AND across the top topic words; fall back to OR only when asked.
+        $joiner = $mode === 'or' ? ' OR ' : ' AND ';
+        // For AND, require at least the first 2–3 keywords so rare queries still match.
+        if ($mode === 'and' && count($likes) > 3) {
+            $likes = array_slice($likes, 0, 3);
+            $binds = array_slice($binds, 0, 3);
+        }
+
         [$categorySql, $categoryBinds] = $this->categoryFilterSql($categoryIds);
         foreach ($categoryBinds as $b) {
             $binds[] = $b;
@@ -919,7 +954,7 @@ class ChatController {
              FROM document_chunks dc
              JOIN documents d ON d.id = dc.document_id AND d.status = \'ready\'
              JOIN categories c ON c.id = d.category_id
-             WHERE (' . implode(' OR ', $likes) . ")
+             WHERE (' . implode($joiner, $likes) . ")
              AND d.category_id IS NOT NULL
              $categorySql
              ORDER BY dc.document_id, dc.page_number
@@ -975,12 +1010,23 @@ class ChatController {
             }
 
             $score = (float) ($chunk['rerank_score'] ?? 0);
-            if ($score < 0.15) {
+            if ($score < 0.25) {
+                continue;
+            }
+
+            // Require real topic overlap — don't recover from a single shared word.
+            $phrase = (float) ($chunk['phrase_score'] ?? ChunkReranker::phraseMatchScore($content, $question));
+            $cover  = (float) ($chunk['coverage'] ?? ChunkReranker::topicCoverage($content, $question));
+            if ($phrase < 0.55 && $cover < 0.6) {
                 continue;
             }
 
             $answer = $this->extractRelevantPassage($content, $qTokens);
             if (mb_strlen($answer) < 40) {
+                continue;
+            }
+            if (ChunkReranker::phraseMatchScore($answer, $question) < 0.4
+                && ChunkReranker::topicCoverage($answer, $question) < 0.5) {
                 continue;
             }
 

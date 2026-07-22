@@ -488,26 +488,30 @@ export async function resolveAssistantTurn(
     };
   }
 
-  const needsBetterAnswer =
-    !isAnswered ||
-    isNotFoundAnswer(answer) ||
-    looksLikeRawDump(answer) ||
-    // Upstream may have answered from other manuals — rebuild from scoped hits.
-    Boolean(scopedCategoryIds && isAnswered && !hasScopedHits && inScopeRawSources.length === 0);
-
-  // Prefer scoped PDF recovery when category filter is active.
-  const preferScopedRecovery = Boolean(scopedCategoryIds && hasScopedHits);
-
+  const hitText = hit ? `${hit.sentence} ${hit.pageText}` : '';
+  const hitPhrase = hit ? phraseMatchScore(hitText, question) : 0;
+  const hitCoverage = hit ? topicCoverage(hitText, question) : 0;
   const strongPdfHit =
     Boolean(hit) &&
-    (phraseMatchScore(hit!.sentence + ' ' + hit!.pageText, question) >= 0.65 ||
-      hit!.score >= 0.85);
+    (hitPhrase >= 0.65 || (hit!.score >= 0.85 && hitCoverage >= 0.6));
 
+  // Only override a good API answer when PDF evidence is clearly stronger/on-topic.
   const apiTopicWeak =
     Boolean(answer) &&
     !isNotFoundAnswer(answer) &&
     phraseMatchScore(answer, question) < 0.5 &&
     topicCoverage(answer, question) < 0.6;
+
+  const needsBetterAnswer =
+    !isAnswered ||
+    isNotFoundAnswer(answer) ||
+    looksLikeRawDump(answer) ||
+    Boolean(scopedCategoryIds && isAnswered && !hasScopedHits && inScopeRawSources.length === 0);
+
+  // Prefer scoped PDF recovery when category filter is active AND the hit is on-topic.
+  const preferScopedRecovery = Boolean(
+    scopedCategoryIds && hasScopedHits && (hitPhrase >= 0.55 || hitCoverage >= 0.6)
+  );
 
   let finalAnswer = scopedCategoryIds && !hasScopedHits && inScopeRawSources.length === 0
     ? ''
@@ -523,10 +527,13 @@ export async function resolveAssistantTurn(
     finalAnswer = '';
   }
 
-  if (
-    (needsBetterAnswer || preferScopedRecovery || (strongPdfHit && apiTopicWeak)) &&
-    hits.length > 0
-  ) {
+  // Keep a solid LLM answer unless PDF recovery is clearly better / needed.
+  const shouldRecoverFromPdf =
+    hits.length > 0 &&
+    strongPdfHit &&
+    (needsBetterAnswer || preferScopedRecovery || (strongPdfHit && apiTopicWeak && finalAnswered));
+
+  if (shouldRecoverFromPdf) {
     const llmPassages = hits.slice(0, 3).map((h) => ({
       fileName: h.fileName,
       page: h.physicalPage,
@@ -554,7 +561,12 @@ export async function resolveAssistantTurn(
 
   if (!finalAnswered && hit && hit.score >= MIN_HIT_SCORE) {
     const extracted = buildDetailedAnswer(hit.pageText, question, hit.sentence);
-    if (extracted && extracted.length >= 15) {
+    const ok =
+      extracted &&
+      extracted.length >= 15 &&
+      (phraseMatchScore(extracted, question) >= 0.55 ||
+        topicCoverage(extracted, question) >= 0.6);
+    if (ok) {
       finalAnswer = extracted;
       finalAnswered = true;
     }
@@ -563,8 +575,9 @@ export async function resolveAssistantTurn(
   if (
     finalAnswered &&
     hit &&
+    strongPdfHit &&
     finalAnswer.trim().length < 280 &&
-    phraseMatchScore(hit.pageText, question) >= 0.45
+    phraseMatchScore(hit.pageText, question) >= 0.55
   ) {
     const extracted = buildDetailedAnswer(hit.pageText, question, hit.sentence);
     if (extracted.length > finalAnswer.trim().length * 1.4) {
@@ -585,7 +598,15 @@ export async function resolveAssistantTurn(
   let sources: SourceLike[] = [];
 
   if (hits.length > 0) {
-    const scored = hits.filter((h) => h.score >= MIN_HIT_SCORE);
+    const scored = hits.filter((h) => {
+      if (h.score < MIN_HIT_SCORE) return false;
+      const text = `${h.sentence} ${h.pageText}`;
+      return (
+        phraseMatchScore(text, question) >= 0.55 ||
+        topicCoverage(text, question) >= 0.6 ||
+        h.score >= 0.9
+      );
+    });
     const headingStrict = isHeadingStyleQuestion(question)
       ? scored.filter((h) => h.headingScore >= 0.65)
       : scored;
@@ -1324,7 +1345,7 @@ type AnswerHit = {
 };
 
 const MAX_ANSWER_HITS = 5;
-const MIN_HIT_SCORE = 0.35;
+const MIN_HIT_SCORE = 0.45;
 
 function considerHit(hits: AnswerHit[], candidate: AnswerHit): void {
   if (candidate.score < MIN_HIT_SCORE) return;

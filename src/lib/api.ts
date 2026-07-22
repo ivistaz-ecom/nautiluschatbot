@@ -358,6 +358,11 @@ export interface ChatMessage {
   user_name?: string;
   user_email?: string;
   category_name?: string;
+  /** Spelling correction suggestion */
+  did_you_mean?: string | null;
+  /** Related topics the user may be looking for */
+  looking_for?: string[];
+  suggestions?: string[];
 }
 
 /**
@@ -516,6 +521,12 @@ export interface AskResponse {
   is_answered: boolean;
   query_id?: number;
   from_cache?: boolean;
+  /** Corrected spelling of the query when close */
+  did_you_mean?: string | null;
+  /** Related questions / topics */
+  looking_for?: string[];
+  /** Flat list for older clients */
+  suggestions?: string[];
 }
 
 export interface FAQ {

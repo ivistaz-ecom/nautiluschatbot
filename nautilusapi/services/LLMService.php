@@ -89,6 +89,7 @@ Return STRICT JSON only with exactly these fields:
 
 Rules:
 - Write 3–6 complete sentences (or a short structured summary) that fully answer the question.
+- Prefer excerpts that contain the SAME topic phrase as the question (e.g. "hot work procedure"), not pages that only share one related word like "procedure" or "work".
 - Include key requirements, steps, responsibilities, referenced procedures, and codes (e.g. SFT 04) when they appear in the excerpts.
 - Prefer a fuller reply over a one-line summary; stay focused on the question.
 - Format with line breaks when helpful: section title on its own line, blank line, explanation paragraph, then each list item (a/b/c) on its own line. Do not collapse structured content into one paragraph.
@@ -98,12 +99,13 @@ Rules:
 - If multiple sources contributed, include all relevant source IDs.
 - Do not invent source IDs.
 - Do not cite table-of-contents or index entries unless they actually contain the answer.
-- If the answer is not found in the provided sources, return:
+- If none of the excerpts truly answer this topic, return:
 {
   "answer": "I could not find this information in the available documents.",
   "usedSources": []
 }
 - Never make up information.
+- Never stitch together unrelated keyword hits into a fake procedure.
 
 --- DOCUMENT EXCERPTS ---
 {$context}

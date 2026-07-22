@@ -1,6 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { resolveAssistantTurn, mergeAssistantSources } from '@/lib/chat-source-attribution';
 import { API_BACKEND_URL } from '@/lib/api-config';
+import {
+  buildSuggestionBundle,
+  fetchSuggestionInputs,
+} from '@/lib/query-suggestions';
 
 export const dynamic = 'force-dynamic';
 
@@ -22,9 +26,25 @@ function notFoundInSelectedCategoriesMessage(categoryIds: number[]): string {
     : 'The given question was not found in the selected categories.';
 }
 
+function extractTopicHints(sources: unknown[]): string[] {
+  const hints: string[] = [];
+  for (const raw of sources) {
+    if (!raw || typeof raw !== 'object') continue;
+    const src = raw as Record<string, unknown>;
+    const excerpt = String(src.excerpt ?? src.snippet ?? '').trim();
+    if (excerpt) {
+      const firstLine = excerpt.split('\n').map((l) => l.trim()).find((l) => l.length >= 8);
+      if (firstLine) hints.push(firstLine.slice(0, 90));
+    }
+    const title = String(src.fileName ?? src.document_title ?? '').trim();
+    if (title) hints.push(title.replace(/\.pdf$/i, ''));
+  }
+  return hints;
+}
+
 /**
  * Proxies POST /chat/ask to the PHP API, then recovers missed answers
- * and attaches exact PDF page citations.
+ * and attaches exact PDF page citations + query suggestions when weak.
  */
 export async function POST(req: NextRequest) {
   const auth = req.headers.get('authorization') || '';
@@ -84,6 +104,41 @@ export async function POST(req: NextRequest) {
     data.answer = resolved.answer;
     data.is_answered = resolved.is_answered;
     data.sources = mergeAssistantSources(auth, resolved.sources, rawSources);
+  }
+
+  // Suggest alternatives when the query didn't closely match (or not found).
+  const needsSuggestions =
+    !data.is_answered ||
+    (Array.isArray(data.sources) && data.sources.length === 0) ||
+    /could not find|not found/i.test(String(data.answer || ''));
+
+  if (needsSuggestions && question.trim().length >= 3) {
+    const upstreamSuggestions = Array.isArray(data.suggestions)
+      ? data.suggestions.map((s: unknown) => String(s)).filter(Boolean)
+      : [];
+    const inputs = await fetchSuggestionInputs(auth, API_BACKEND_URL, categoryIds);
+    const topicHints = [
+      ...upstreamSuggestions,
+      ...extractTopicHints(Array.isArray(data.sources) ? data.sources : []),
+      ...extractTopicHints(rawSources),
+    ];
+    const bundle = buildSuggestionBundle(question, {
+      faqs: inputs.faqs,
+      documentTitles: inputs.documentTitles,
+      topicHints,
+      limit: 4,
+    });
+
+    data.did_you_mean = bundle.did_you_mean || null;
+    data.looking_for = bundle.looking_for;
+    data.suggestions = [
+      ...(bundle.did_you_mean ? [bundle.did_you_mean] : []),
+      ...bundle.looking_for,
+    ].slice(0, 5);
+  } else {
+    data.did_you_mean = null;
+    data.looking_for = [];
+    data.suggestions = [];
   }
 
   payload.data = data;
