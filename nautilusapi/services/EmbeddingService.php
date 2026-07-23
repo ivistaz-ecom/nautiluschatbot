@@ -7,6 +7,9 @@ require_once __DIR__ . '/../core/Database.php';
 /**
  * OpenAI text embeddings for semantic chunk retrieval...
  */
+
+
+ 
 class EmbeddingService {
     private string $apiKey;
     private string $model;
