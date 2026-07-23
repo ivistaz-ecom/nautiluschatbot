@@ -4,6 +4,7 @@
 require_once __DIR__ . '/../../../core/Logger.php';
 require_once __DIR__ . '/../../../middleware/AuthMiddleware.php';
 require_once __DIR__ . '/../../../services/DocumentParser.php';
+// EmbeddingService is loaded lazily in ingest so missing file does not break API boot.
 
 class DocumentController {
 
@@ -506,10 +507,18 @@ class DocumentController {
                         continue;
                     }
                     Logger::info('Saving chunk ' . json_encode(['page_number' => $pageNum, 'length' => strlen($chunk)]));
-                    Database::insert(
+                    $chunkId = (int) Database::insert(
                         'INSERT INTO document_chunks (document_id, page_number, chunk_index, content) VALUES (?,?,?,?)',
                         [$docId, $pageNum, $idx, $chunk]
                     );
+                    if ($chunkId > 0) {
+                        try {
+                            require_once __DIR__ . '/../../../services/EmbeddingService.php';
+                            (new EmbeddingService())->embedAndStoreChunk($chunkId, $chunk);
+                        } catch (Throwable $e) {
+                            Logger::warn('Embedding failed for chunk ' . $chunkId . ': ' . $e->getMessage());
+                        }
+                    }
                     $chunkCount++;
                 }
             }

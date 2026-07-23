@@ -1,11 +1,15 @@
 <?php
 // backend/services/LLMService.php
 
-require_once __DIR__ . '/SourceAttributor.php';
 require_once __DIR__ . '/DocumentParser.php';
 require_once __DIR__ . '/../core/Logger.php';
 
 class LLMService {
+
+    private static function requireSourceAttributor(): void {
+        require_once __DIR__ . '/SourceAttributor.php';
+    }
+
     private string $provider;
     private string $apiKey;
     private string $model;
@@ -71,7 +75,10 @@ class LLMService {
         foreach ($chunks as $i => $chunk) {
             $fileName = $this->escapePromptValue($chunk['title'] ?? 'Document');
             $pageNumber = $chunk['page_number'] ?? 'unknown';
-            $content = trim((string) ($chunk['content'] ?? ''));
+            $content = $this->stripManualChrome(trim((string) ($chunk['content'] ?? '')));
+            if ($content === '') {
+                continue;
+            }
             $parts[] = "SOURCE {$i}\nFile: {$fileName}\nPage: {$pageNumber}\nText:\n{$content}";
         }
         return implode("\n\n-------------------\n\n", $parts);
@@ -79,33 +86,29 @@ class LLMService {
 
     private function buildPrompt(string $question, string $context): string {
         return <<<PROMPT
-You are a knowledge assistant for Nautilus Shipping. Answer questions using ONLY the document excerpts provided below. Do NOT use any external knowledge.
+You are a knowledge assistant for Nautilus Shipping. Answer using ONLY the document excerpts below. Do NOT use external knowledge.
 
-Return STRICT JSON only with exactly these fields:
+Return STRICT JSON only:
 {
-  "answer": "clear answer with enough detail to be useful",
-  "usedSources": [0, 2]
+  "answer": "concise answer in your own words",
+  "usedSources": [0]
 }
 
 Rules:
-- Write 3–6 complete sentences (or a short structured summary) that fully answer the question.
-- Prefer excerpts that contain the SAME topic phrase as the question (e.g. "hot work procedure"), not pages that only share one related word like "procedure" or "work".
-- Include key requirements, steps, responsibilities, referenced procedures, and codes (e.g. SFT 04) when they appear in the excerpts.
-- Prefer a fuller reply over a one-line summary; stay focused on the question.
-- Format with line breaks when helpful: section title on its own line, blank line, explanation paragraph, then each list item (a/b/c) on its own line. Do not collapse structured content into one paragraph.
-- When the excerpts only reference another manual/procedure, say clearly what this document requires and which procedure to follow — do not invent steps that are not present.
-- Use the SOURCE IDs from the document excerpts below.
-- If the answer is based on the documents, include at least one source ID in usedSources.
-- If multiple sources contributed, include all relevant source IDs.
-- Do not invent source IDs.
-- Do not cite table-of-contents or index entries unless they actually contain the answer.
-- If none of the excerpts truly answer this topic, return:
+- Answer the EXACT question the user asked (the specific ask), not a nearby related topic.
+- Write a clear paraphrase a colleague would understand — 2–5 sentences, or a short numbered/lettered list for steps.
+- NEVER paste document chrome: titles like "COMPANY OPERATING MANUAL", "SECTION:", "Page Number", "Page X of Y", "Issue No", revision lines, or header/footer banners.
+- NEVER paste long verbatim blocks from the excerpts. Quote at most one short phrase if essential.
+- Every sentence must be supported by the excerpts. Ignore excerpts that only share keywords but do not answer the ask.
+- Prefer the 1–2 best excerpts. Put only those SOURCE IDs in usedSources (max 2).
+- Include codes (e.g. SFT 04) only when they appear in the excerpts and help answer.
+- Do not invent source IDs or facts. Do not cite table-of-contents / index rows.
+- If none of the excerpts actually answer this exact question, return exactly:
 {
   "answer": "I could not find this information in the available documents.",
   "usedSources": []
 }
-- Never make up information.
-- Never stitch together unrelated keyword hits into a fake procedure.
+- Never stitch unrelated keyword hits into a fake answer.
 
 --- DOCUMENT EXCERPTS ---
 {$context}
@@ -115,6 +118,96 @@ Question: {$question}
 
 Response:
 PROMPT;
+    }
+
+    /** Remove PDF header/footer chrome that models tend to copy into answers. */
+    private function stripManualChrome(string $text): string {
+        $lines = preg_split('/\R/u', $text) ?: [];
+        $kept = [];
+        foreach ($lines as $line) {
+            $t = trim($line);
+            if ($t === '') {
+                continue;
+            }
+            if ($this->isManualChromeLine($t)) {
+                continue;
+            }
+            // Inline chrome often appears mid-line after OCR collapse.
+            $t = preg_replace(
+                '/\b(COMPANY|SHIP|SAFETY|HEALTH)\s+OPERATING\s+MANUAL\b[^.]{0,80}/iu',
+                '',
+                $t
+            ) ?? $t;
+            $t = preg_replace('/\bPage\s+Number\s*:\s*[^\n.]{0,60}/iu', '', $t) ?? $t;
+            $t = preg_replace('/\bPage\s+\d+\s+of\s+\d+\b/iu', '', $t) ?? $t;
+            $t = preg_replace('/\bIssue\s+No\s*:?\s*\d+\b/iu', '', $t) ?? $t;
+            $t = preg_replace('/\bSECTION\s*:\s*\d+[^\n.]{0,40}/iu', '', $t) ?? $t;
+            $t = trim(preg_replace('/\s{2,}/u', ' ', $t) ?? $t);
+            if ($t !== '' && !$this->isManualChromeLine($t)) {
+                $kept[] = $t;
+            }
+        }
+        return trim(implode("\n", $kept));
+    }
+
+    private function isManualChromeLine(string $line): bool {
+        $l = mb_strtolower($line);
+        if ($l === '') {
+            return true;
+        }
+        if (preg_match('/\b(operating\s+manual|document\s+number|electronic\s+copy|uncontrolled\s+if\s+printed|section\s+revision|revision\s+number|issue\s+no)\b/i', $line)) {
+            return true;
+        }
+        if (preg_match('/^page\s+number\s*:/i', $line)) {
+            return true;
+        }
+        if (preg_match('/^section\s*:\s*\d+/i', $line)) {
+            return true;
+        }
+        if (preg_match('/^page\s+\d+\s+of\s+\d+/i', $line)) {
+            return true;
+        }
+        // Pure banner titles
+        if (preg_match('/^(company|ship|safety|health|chemical)\s+.+\s+manual\s*$/i', $line) && mb_strlen($line) < 80) {
+            return true;
+        }
+        return false;
+    }
+
+    private function looksLikeRawDump(string $answer): bool {
+        if (preg_match('/\b(page\s+number\s*:|page\s+\d+\s+of\s+\d+|operating\s+manual|issue\s+no\s*:|uncontrolled\s+if\s+printed|document\s+number)\b/i', $answer)) {
+            return true;
+        }
+        // Very long answers with little punctuation often mean a pasted chunk.
+        $len = mb_strlen($answer);
+        if ($len > 900 && substr_count($answer, '.') < 3) {
+            return true;
+        }
+        return false;
+    }
+
+    /** Public sanitizer used after LLM + before persist. */
+    public function sanitizeAnswer(string $answer): string {
+        $text = trim($answer);
+        if ($text === '') {
+            return '';
+        }
+        // Drop chrome even when the model pasted it as one long line.
+        $text = preg_replace(
+            '/\b(COMPANY|SHIP|SAFETY|HEALTH|CHEMICAL)\s+[A-Z][A-Z\s\/\-]{0,40}MANUAL\b/iu',
+            '',
+            $text
+        ) ?? $text;
+        $text = preg_replace('/\bSECTION\s*:\s*\d+\s*[-–—]?\s*[A-Z][A-Z\s]{0,40}/iu', '', $text) ?? $text;
+        $text = preg_replace('/\bPage\s+Number\s*:\s*[^\n.]{0,80}/iu', '', $text) ?? $text;
+        $text = preg_replace('/\bPage\s+\d+\s+of\s+\d+\b/iu', '', $text) ?? $text;
+        $text = preg_replace('/\bIssue\s+No\s*:?\s*\d+\b/iu', '', $text) ?? $text;
+        $text = preg_replace('/\bCOM\s*:\s*\d+\s*:\s*/iu', '', $text) ?? $text;
+        $text = trim(preg_replace('/\s{2,}/u', ' ', $text) ?? $text);
+        // If a section code remains at the start ("4.3 DRUG AND ALCOHOL POLICY The Company…"),
+        // keep the heading only when followed by prose on the same run — normalize spacing.
+        $text = preg_replace('/^(\d+(?:\.\d+){0,3}\s+[A-Z][A-Z0-9\s\/\-&]{3,60})\s+/u', "$1\n\n", $text) ?? $text;
+        return trim($text);
     }
 
     private function escapePromptValue(mixed $value): string {
@@ -245,14 +338,40 @@ PROMPT;
             ];
         }
 
+        $answer = $this->sanitizeAnswer($answer);
+        if ($answer === '' || $this->looksLikeRawDump($answer) || mb_strlen($answer) < 25) {
+            Logger::info('[citation] answer rejected as empty/raw dump after sanitize');
+            return [
+                'answer'     => 'I could not find this information in the available documents.',
+                'sources'    => [],
+                'confidence' => 0.0,
+                'answered'   => false,
+            ];
+        }
+
         $sources = [];
         if (!empty($usedSourceIds)) {
             Logger::info('[citation] used_source_ids=' . implode(',', $usedSourceIds));
             $sources = self::resolveSourcesFromIds($usedSourceIds, $chunks);
         }
 
-        // ALWAYS attach at least one source for document-backed answers
-        $sources = SourceAttributor::ensureNonEmptySources($sources, $chunks);
+        // Prefer sources whose chunk text overlaps the answer (correct PDF + page).
+        self::requireSourceAttributor();
+        if (empty($sources)) {
+            $sources = SourceAttributor::attribute($answer, $question, $chunks, $usedSourceIds);
+        } else {
+            // Keep LLM citations, but re-rank/cap by answer overlap when possible.
+            $attributed = SourceAttributor::attribute($answer, $question, $chunks, $usedSourceIds);
+            if (!empty($attributed)) {
+                $sources = $attributed;
+            }
+        }
+        if (empty($sources)) {
+            $sources = SourceAttributor::ensureNonEmptySources([], $chunks);
+        }
+        if (count($sources) > 2) {
+            $sources = array_slice(array_values($sources), 0, 2);
+        }
 
         Logger::info('[citation] final_sources_count=' . count($sources)
             . ' pages=' . implode(',', array_map(
@@ -269,6 +388,7 @@ PROMPT;
     }
 
     public static function resolveSourcesFromIds(array $usedSourceIds, array $chunks): array {
+        self::requireSourceAttributor();
         $resolved = [];
         $seen = [];
 
@@ -358,6 +478,7 @@ PROMPT;
         $result = $this->answer($question, $substantive);
 
         if ($result['answered']) {
+            self::requireSourceAttributor();
             $result['sources'] = SourceAttributor::ensureNonEmptySources(
                 $result['sources'] ?? [],
                 $substantive,

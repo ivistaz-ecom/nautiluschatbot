@@ -10,6 +10,7 @@ require_once $baseDir . '/core/Logger.php';
 require_once $baseDir . '/core/Response.php'; // needed by Database
 require_once $baseDir . '/core/Request.php';
 require_once $baseDir . '/services/DocumentParser.php';
+require_once $baseDir . '/services/EmbeddingService.php';
 
 function processJobs(): void {
     $cfg = require __DIR__ . '/config/config.php';
@@ -82,10 +83,17 @@ function processJobs(): void {
                         continue;
                     }
                     Logger::info('Worker: Saving chunk ' . json_encode(['document_id' => $job['document_id'], 'page_number' => $pageNum, 'length' => strlen($chunk)]));
-                    Database::insert(
+                    $chunkId = (int) Database::insert(
                         'INSERT INTO document_chunks (document_id, page_number, chunk_index, content) VALUES (?,?,?,?)',
                         [$job['document_id'], $pageNum, $idx, $chunk]
                     );
+                    if ($chunkId > 0) {
+                        try {
+                            (new EmbeddingService())->embedAndStoreChunk($chunkId, $chunk);
+                        } catch (Throwable $e) {
+                            Logger::warn('Worker: embedding failed for chunk ' . $chunkId . ': ' . $e->getMessage());
+                        }
+                    }
                     $chunkCount++;
                 }
             }

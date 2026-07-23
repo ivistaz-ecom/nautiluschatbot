@@ -6,9 +6,57 @@ declare(strict_types=1);
 error_reporting(E_ALL);
 ini_set('display_errors', '0'); // Never expose errors to client
 
-// ── Autoload core classes ──────────────────────────────────────────
 $baseDir = __DIR__;
 
+// Register handlers before any requires so boot fatals still return JSON.
+set_exception_handler(function (Throwable $e) {
+    if (class_exists('Logger', false)) {
+        try {
+            Logger::error('Unhandled exception: ' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
+        } catch (Throwable) {
+            // Logger may fail if config/logs are unavailable — still return JSON below.
+        }
+    }
+    $msg = $e->getMessage() !== '' ? $e->getMessage() : 'Internal server error';
+    if (class_exists('Response', false)) {
+        Response::error($msg, 500);
+        return;
+    }
+    if (!headers_sent()) {
+        http_response_code(500);
+        header('Content-Type: application/json; charset=utf-8');
+    }
+    echo json_encode(['success' => false, 'message' => $msg]);
+});
+
+register_shutdown_function(function () {
+    $error = error_get_last();
+    if (!$error || !in_array($error['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
+        return;
+    }
+    if (class_exists('Logger', false)) {
+        try {
+            Logger::error('Fatal: ' . ($error['message'] ?? '') . ' in ' . ($error['file'] ?? '') . ':' . ($error['line'] ?? ''));
+        } catch (Throwable) {
+            // ignore
+        }
+    }
+    if (!headers_sent()) {
+        http_response_code(500);
+        header('Content-Type: application/json; charset=utf-8');
+    }
+    // Avoid double output if an earlier handler already wrote a body.
+    if (ob_get_length() === false || ob_get_length() === 0) {
+        $msg = 'Internal server error';
+        // Include fatal message so Hostinger deploys are debuggable without SSH logs.
+        if (!empty($error['message'])) {
+            $msg = $error['message'];
+        }
+        echo json_encode(['success' => false, 'message' => $msg]);
+    }
+});
+
+// ── Autoload core classes ──────────────────────────────────────────
 require_once $baseDir . '/core/Database.php';
 require_once $baseDir . '/core/Response.php';
 require_once $baseDir . '/core/Request.php';
@@ -24,31 +72,7 @@ require_once $baseDir . '/api/v1/auth/AuthController.php';
 require_once $baseDir . '/api/v1/chat/ChatController.php';
 require_once $baseDir . '/api/v1/documents/DocumentController.php';
 require_once $baseDir . '/api/v1/admin/AdminController.php';
-require_once $baseDir . '/services/LLMService.php';
-
-// ── Global middleware ─────────────────────────────────────────────
-set_exception_handler(function (Throwable $e) {
-    if (class_exists('Logger', false)) {
-        try {
-            Logger::error('Unhandled exception: ' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
-        } catch (Throwable) {
-            // Logger may fail if config/logs are unavailable — still return JSON below.
-        }
-    }
-    Response::error('Internal server error', 500);
-});
-
-register_shutdown_function(function () {
-    $error = error_get_last();
-    if (!$error || !in_array($error['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
-        return;
-    }
-    if (!headers_sent()) {
-        http_response_code(500);
-        header('Content-Type: application/json; charset=utf-8');
-    }
-    echo json_encode(['success' => false, 'message' => 'Internal server error']);
-});
+// LLMService is loaded on demand (chat / health/llm) — do not require at boot.
 
 // Apply whitelist + CORS first
 WhitelistMiddleware::handle();
@@ -150,6 +174,7 @@ $router->get('/health/llm', function() {
     }
 
     try {
+        require_once __DIR__ . '/services/LLMService.php';
         $result = LLMService::ping();
         Response::success(['llm' => 'connected', 'provider' => $result['provider'], 'model' => $result['model']]);
     } catch (Throwable $e) {

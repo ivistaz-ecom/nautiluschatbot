@@ -37,9 +37,21 @@ return [
             'gemini' => 'gemini-1.5-pro',
         ],
         'max_tokens'     => 1024,
-        'context_chunks' => 8,
+        // Fewer chunks → less keyword noise for the LLM.
+        'context_chunks' => 5,
         'chunk_size'     => 500,   // words per chunk
         'chunk_overlap'  => 50,    // words of overlap
+    ],
+
+    // OpenAI embeddings for semantic PDF retrieval (works alongside FULLTEXT).
+    'embeddings' => [
+        'enabled'    => getenv('EMBEDDING_ENABLED') !== 'false',
+        // Prefer EMBEDDING_API_KEY; fall back to OPENAI_API_KEY.
+        'api_key'    => getenv('EMBEDDING_API_KEY') ?: (getenv('OPENAI_API_KEY') ?: ''),
+        'model'      => getenv('EMBEDDING_MODEL') ?: 'text-embedding-3-small',
+        // Lower dims = smaller DB + faster cosine on Hostinger.
+        'dimensions' => (int) (getenv('EMBEDDING_DIMENSIONS') ?: 512),
+        'top_k'      => (int) (getenv('EMBEDDING_TOP_K') ?: 24),
     ],
 
     'mail' => [

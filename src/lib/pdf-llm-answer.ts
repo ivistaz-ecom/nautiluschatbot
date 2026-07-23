@@ -28,20 +28,17 @@ export async function synthesizeAnswerFromPassages(
 
 Return STRICT JSON only:
 {
-  "answer": "3-6 complete sentences that directly answer the question with useful detail",
+  "answer": "2-5 complete sentences that directly answer the question",
   "usedSources": [0]
 }
 
 Rules:
-- Write a natural, conversational reply — as if explaining to a colleague (like ChatGPT).
-- Prefer excerpts that contain the SAME topic phrase as the question (e.g. "superintendent inspections"), not merely related words like "inspection".
-- If multiple sources agree, synthesize one clear answer. If they conflict, prefer the more specific topic match and briefly note any difference.
-- Answer ONLY from the excerpts. Be specific (include frequencies, timeframes, requirements, and key steps when present).
-- Prefer a fuller reply over a one-line summary; typically 100–180 words is fine when the excerpts support it.
-- Include responsibilities, list items (a/b/c), referenced manuals, and procedure codes when present.
-- Format with line breaks: put the section title on its own line, then a blank line, then the explanation paragraph, then each list item (a/b/c) on its own line. Do not collapse everything into one paragraph.
-- When excerpts only point to another procedure, explain what this document says and name the referenced procedure — do not invent missing steps.
-- Do NOT dump document headers or page labels; you may restate list-item substance in plain prose.
+- Write a natural paraphrase — as if explaining to a colleague.
+- Answer ONLY the specific question asked.
+- Do NOT copy document headers, "Page Number", "Page X of Y", manual titles, issue/revision lines, or section banners.
+- Do NOT paste long verbatim blocks; summarize in your own words.
+- Prefer excerpts with the SAME topic as the question, not merely shared keywords.
+- Include frequencies, responsibilities, and procedure codes when present and relevant.
 - Do NOT start with "According to" or cite source numbers in the answer text.
 - Never stitch unrelated keyword hits into a fake answer.
 - If the excerpts do not contain the answer, return:

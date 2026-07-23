@@ -1,16 +1,47 @@
 <?php
 /**
  * Standalone document metadata update endpoint.
- * Upload this ONE file to the same folder as index.php on the server
- * (e.g. public_html/api/v1/document-update.php).
  *
- * Does not require editing index.php or DocumentController.php.
+ * Hostinger path (correct):
+ *   public_html/api/v1/document-update.php
+ *
+ * Upload into the folder that already has admin / auth / chat / documents.
+ * Do NOT create a new folder. Do NOT put this inside documents/.
+ *
+ * Filename must be: document-update.php  (not document_upload.php)
  */
 declare(strict_types=1);
 
 header('Content-Type: application/json; charset=utf-8');
 
-$baseDir = __DIR__;
+/**
+ * Find the app root that contains /core/Database.php
+ * (on Hostinger that is usually public_html, while this file lives in public_html/api/v1).
+ */
+function nautilusFindAppRoot(string $startDir): ?string {
+    $dir = $startDir;
+    for ($i = 0; $i < 6; $i++) {
+        if (is_file($dir . '/core/Database.php')) {
+            return $dir;
+        }
+        $parent = dirname($dir);
+        if ($parent === $dir) {
+            break;
+        }
+        $dir = $parent;
+    }
+    return null;
+}
+
+$baseDir = nautilusFindAppRoot(__DIR__);
+if ($baseDir === null) {
+    http_response_code(500);
+    echo json_encode([
+        'success' => false,
+        'message' => 'Could not find core/Database.php. Upload document-update.php to public_html/api/v1/.',
+    ]);
+    exit;
+}
 
 require_once $baseDir . '/core/Database.php';
 require_once $baseDir . '/core/Response.php';
