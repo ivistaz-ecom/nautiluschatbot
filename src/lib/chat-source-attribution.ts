@@ -67,6 +67,9 @@ export function getPage(source: SourceLike): number | null {
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
+/** Max source cards shown in chat — keep ask + refresh consistent. */
+export const MAX_DISPLAY_SOURCES = 2;
+
 /** One card per document — keep the best page when duplicates exist. */
 export function dedupeSources(sources: SourceLike[]): SourceLike[] {
   const byFile = new Map<number, SourceLike>();
@@ -89,6 +92,54 @@ export function dedupeSources(sources: SourceLike[]): SourceLike[] {
   }
 
   return Array.from(byFile.values());
+}
+
+/**
+ * Prefer sources that actually support the answer text (not keyword-only PDF hits).
+ * Keeps ask-time and refresh-time cards aligned with what PHP persisted.
+ */
+export function rankAndCapSources(
+  sources: SourceLike[],
+  answer: string,
+  question: string,
+  limit = MAX_DISPLAY_SOURCES
+): SourceLike[] {
+  const deduped = dedupeSources(sources);
+  if (deduped.length <= 1) return deduped;
+
+  const answerText = (answer || '').trim();
+  const scored = deduped.map((src, index) => {
+    const excerpt = String(src.excerpt ?? src.snippet ?? src.text ?? '').trim();
+    const title = String(src.fileName ?? src.document_title ?? '').trim();
+    const blob = `${excerpt} ${title}`.trim();
+
+    let score = 0;
+    if (answerText && blob) {
+      score += phraseMatchScore(blob, answerText) * 2.2;
+      score += topicCoverage(blob, answerText) * 1.4;
+      // Shared tokens between answer and excerpt (citation grounding).
+      const aTokens = significantTokens(answerText);
+      const bLower = blob.toLowerCase();
+      const shared = aTokens.filter((t) => bLower.includes(t)).length;
+      score += aTokens.length ? shared / aTokens.length : 0;
+    }
+    if (question && blob) {
+      score += phraseMatchScore(blob, question) * 0.6;
+      score += topicCoverage(blob, question) * 0.4;
+    }
+    // Prefer sources the LLM already ranked higher.
+    const rank = Number(src.relevance_rank ?? src.relevanceRank ?? index + 1);
+    if (Number.isFinite(rank) && rank > 0) {
+      score += Math.max(0, 0.35 - (rank - 1) * 0.08);
+    }
+    return { src, score, index };
+  });
+
+  scored.sort((a, b) => b.score - a.score || a.index - b.index);
+  return scored.slice(0, Math.max(1, limit)).map((row, i) => ({
+    ...row.src,
+    relevance_rank: i + 1,
+  }));
 }
 
 function isNotFoundAnswer(answer: string): boolean {
@@ -140,7 +191,45 @@ export function finalizeSourceLinks(auth: string, sources: SourceLike[]): Source
 }
 
 function looksLikeRawDump(answer: string): boolean {
-  return /document number|electronic copy|uncontrolled if printed/i.test(answer);
+  const a = answer || '';
+  if (
+    /document number|electronic copy|uncontrolled if printed|page\s+number\s*:|page\s+\d+\s+of\s+\d+|issue\s+no\s*:|operating\s+manual|section\s*:\s*\d+/i.test(
+      a
+    )
+  ) {
+    return true;
+  }
+  // Long low-punctuation paste of a chunk
+  if (a.length > 900 && (a.match(/\./g) || []).length < 3) {
+    return true;
+  }
+  return false;
+}
+
+/** Strip PDF header/footer chrome from any answer string (LLM or extractive). */
+export function sanitizeChatAnswer(answer: string): string {
+  let text = String(answer || '').trim();
+  if (!text) return '';
+
+  text = text.replace(
+    /\b(COMPANY|SHIP|SAFETY|HEALTH|CHEMICAL)\s+[A-Z][A-Z\s/\-]{0,40}MANUAL\b/gi,
+    ''
+  );
+  text = text.replace(/\bSECTION\s*:\s*\d+\s*[-–—]?\s*[A-Z][A-Z\s]{0,40}/gi, '');
+  text = text.replace(/\bPage\s+Number\s*:\s*[^\n.]{0,80}/gi, '');
+  text = text.replace(/\bPage\s+\d+\s+of\s+\d+\b/gi, '');
+  text = text.replace(/\bIssue\s+No\s*:?\s*\d+\b/gi, '');
+  text = text.replace(/\b(?:COM|SOM|SMA|HSEM|CTOM)\s*:\s*\d+\s*:\s*/gi, '');
+  text = text.replace(/\s{2,}/g, ' ').trim();
+
+  // Drop leading chrome-only residue
+  const lines = text
+    .split(/\n+/)
+    .map((l) => l.trim())
+    .filter((l) => l && !isBoilerplateLine(l));
+  text = lines.join('\n').replace(/\s{2,}/g, ' ').trim();
+
+  return text;
 }
 
 type PageLocation = {
@@ -423,19 +512,29 @@ export async function resolveSessionMessage(
   isAnswered: boolean,
   rawSources: SourceLike[] | null | undefined
 ): Promise<{ answer: string; is_answered: boolean; sources: SourceLike[] }> {
-  const answered = isAnswered && Boolean(answer) && !isNotFoundAnswer(answer);
-  const sources = Array.isArray(rawSources) ? dedupeSources(rawSources) : [];
+  const cleaned = sanitizeChatAnswer(answer);
+  const answered =
+    isAnswered &&
+    Boolean(cleaned) &&
+    !isNotFoundAnswer(cleaned) &&
+    !looksLikeRawDump(cleaned);
+  const sources = rankAndCapSources(
+    Array.isArray(rawSources) ? rawSources : [],
+    cleaned,
+    question,
+    MAX_DISPLAY_SOURCES
+  );
 
   if (!answered) {
     return {
-      answer,
+      answer: cleaned || answer,
       is_answered: false,
       sources: auth && sources.length ? finalizeSourceLinks(auth, sources) : [],
     };
   }
 
   return {
-    answer,
+    answer: cleaned,
     is_answered: true,
     sources: auth && sources.length ? finalizeSourceLinks(auth, sources) : [],
   };
@@ -496,43 +595,56 @@ export async function resolveAssistantTurn(
     Boolean(hit) &&
     (hitPhrase >= 0.65 || (hit!.score >= 0.85 && hitCoverage >= 0.6));
 
-  // Only override a good API answer when PDF evidence is clearly stronger/on-topic.
+  // Sanitize upstream answer first (strips manual headers the model may have pasted).
+  const cleanedUpstream = sanitizeChatAnswer(answer);
+  const upstreamIsDump = looksLikeRawDump(answer) || looksLikeRawDump(cleanedUpstream);
+
   const apiTopicWeak =
-    Boolean(answer) &&
-    !isNotFoundAnswer(answer) &&
-    phraseMatchScore(answer, question) < 0.5 &&
-    topicCoverage(answer, question) < 0.6;
+    Boolean(cleanedUpstream) &&
+    !isNotFoundAnswer(cleanedUpstream) &&
+    phraseMatchScore(cleanedUpstream, question) < 0.5 &&
+    topicCoverage(cleanedUpstream, question) < 0.6;
+
+  const apiAnswerOk =
+    Boolean(isAnswered) &&
+    !isNotFoundAnswer(cleanedUpstream) &&
+    !upstreamIsDump &&
+    cleanedUpstream.trim().length >= 40 &&
+    phraseMatchScore(cleanedUpstream, question) >= 0.35;
 
   const needsBetterAnswer =
     !isAnswered ||
-    isNotFoundAnswer(answer) ||
-    looksLikeRawDump(answer) ||
+    isNotFoundAnswer(cleanedUpstream) ||
+    upstreamIsDump ||
+    cleanedUpstream.trim().length < 25 ||
     Boolean(scopedCategoryIds && isAnswered && !hasScopedHits && inScopeRawSources.length === 0);
 
-  // Prefer scoped PDF recovery when category filter is active AND the hit is on-topic.
   const preferScopedRecovery = Boolean(
     scopedCategoryIds && hasScopedHits && (hitPhrase >= 0.55 || hitCoverage >= 0.6)
   );
 
-  let finalAnswer = scopedCategoryIds && !hasScopedHits && inScopeRawSources.length === 0
-    ? ''
-    : answer;
+  let finalAnswer =
+    scopedCategoryIds && !hasScopedHits && inScopeRawSources.length === 0
+      ? ''
+      : cleanedUpstream;
   let finalAnswered =
     Boolean(isAnswered) &&
-    !isNotFoundAnswer(answer) &&
+    !isNotFoundAnswer(cleanedUpstream) &&
+    !upstreamIsDump &&
     !(scopedCategoryIds && !hasScopedHits && inScopeRawSources.length === 0);
 
-  // When category-scoped, only keep upstream answer if we also have in-scope evidence.
   if (scopedCategoryIds && finalAnswered && !hasScopedHits && inScopeRawSources.length === 0) {
     finalAnswered = false;
     finalAnswer = '';
   }
 
-  // Keep a solid LLM answer unless PDF recovery is clearly better / needed.
+  // Never replace a solid paraphrased API answer with a raw PDF extract.
+  // Only recover when the API answer is missing, a dump, or clearly off-topic.
   const shouldRecoverFromPdf =
+    !apiAnswerOk &&
     hits.length > 0 &&
     strongPdfHit &&
-    (needsBetterAnswer || preferScopedRecovery || (strongPdfHit && apiTopicWeak && finalAnswered));
+    (needsBetterAnswer || preferScopedRecovery || (strongPdfHit && apiTopicWeak));
 
   if (shouldRecoverFromPdf) {
     const llmPassages = hits.slice(0, 3).map((h) => ({
@@ -541,30 +653,30 @@ export async function resolveAssistantTurn(
       text: h.pageText,
     }));
     const synthesized = await synthesizeAnswerFromPassages(question, llmPassages);
-    const extracted = buildDetailedAnswer(hit!.pageText, question, hit!.sentence);
-    const candidate = synthesized || extracted;
+    const extractedRaw = buildDetailedAnswer(hit!.pageText, question, hit!.sentence);
+    const extracted = sanitizeChatAnswer(extractedRaw);
+
+    // Prefer paraphrased synthesis; use extract only if clean and not a dump.
+    let candidate =
+      synthesized && !looksLikeRawDump(synthesized) ? sanitizeChatAnswer(synthesized) : '';
+    if (!candidate && extracted && !looksLikeRawDump(extracted) && extracted.length >= 40) {
+      candidate = extracted;
+    }
 
     if (candidate && candidate.length >= 15 && !isNotFoundAnswer(candidate)) {
-      if (
-        synthesized &&
-        extracted &&
-        synthesized.length < 220 &&
-        extracted.length > synthesized.length * 1.6 &&
-        phraseMatchScore(extracted, question) >= phraseMatchScore(synthesized, question)
-      ) {
-        finalAnswer = extracted;
-      } else {
-        finalAnswer = candidate;
-      }
+      finalAnswer = candidate;
       finalAnswered = true;
     }
   }
 
   if (!finalAnswered && hit && hit.score >= MIN_HIT_SCORE) {
-    const extracted = buildDetailedAnswer(hit.pageText, question, hit.sentence);
+    const extracted = sanitizeChatAnswer(
+      buildDetailedAnswer(hit.pageText, question, hit.sentence)
+    );
     const ok =
       extracted &&
-      extracted.length >= 15 &&
+      extracted.length >= 40 &&
+      !looksLikeRawDump(extracted) &&
       (phraseMatchScore(extracted, question) >= 0.55 ||
         topicCoverage(extracted, question) >= 0.6);
     if (ok) {
@@ -577,13 +689,29 @@ export async function resolveAssistantTurn(
     finalAnswered &&
     hit &&
     strongPdfHit &&
-    finalAnswer.trim().length < 280 &&
+    !looksLikeRawDump(finalAnswer) &&
+    finalAnswer.trim().length < 120 &&
     phraseMatchScore(hit.pageText, question) >= 0.55
   ) {
-    const extracted = buildDetailedAnswer(hit.pageText, question, hit.sentence);
-    if (extracted.length > finalAnswer.trim().length * 1.4) {
-      finalAnswer = extracted;
+    // Optionally expand a very short paraphrase via synthesis only (never raw dump).
+    const llmPassages = [
+      { fileName: hit.fileName, page: hit.physicalPage, text: hit.pageText },
+    ];
+    const synthesized = await synthesizeAnswerFromPassages(question, llmPassages);
+    const cleanSynth = synthesized ? sanitizeChatAnswer(synthesized) : '';
+    if (
+      cleanSynth &&
+      !looksLikeRawDump(cleanSynth) &&
+      cleanSynth.length > finalAnswer.trim().length * 1.3
+    ) {
+      finalAnswer = cleanSynth;
     }
+  }
+
+  finalAnswer = sanitizeChatAnswer(finalAnswer);
+  if (finalAnswered && (looksLikeRawDump(finalAnswer) || finalAnswer.trim().length < 25)) {
+    finalAnswered = false;
+    finalAnswer = '';
   }
 
   if (!finalAnswered) {
@@ -596,13 +724,58 @@ export async function resolveAssistantTurn(
     };
   }
 
+  // Prefer PHP/LLM citations (same ones persisted to DB) over keyword PDF scans.
+  // Ask used to merge every PDF hit → 4–5 cards; refresh showed only DB rows → 1–2.
   let sources: SourceLike[] = [];
+  const upstreamPreferred = dedupeSources(
+    inScopeRawSources.length > 0
+      ? inScopeRawSources
+      : Array.isArray(rawSources)
+        ? rawSources
+        : []
+  );
 
-  if (hits.length > 0) {
+  if (upstreamPreferred.length > 0) {
+    // Correct pages when a strong hit exists for the same document; do not add new PDFs.
+    const byFileHit = new Map(hits.map((h) => [h.fileId, h]));
+    let corrected = upstreamPreferred.map((src, index) => {
+      const fileId = getFileId(src);
+      const hitForDoc = fileId > 0 ? byFileHit.get(fileId) : undefined;
+      if (
+        hitForDoc &&
+        hitForDoc.score >= MIN_HIT_SCORE &&
+        (phraseMatchScore(`${hitForDoc.sentence} ${hitForDoc.pageText}`, finalAnswer) >= 0.45 ||
+          phraseMatchScore(`${hitForDoc.sentence} ${hitForDoc.pageText}`, question) >= 0.55)
+      ) {
+        return {
+          ...sourceFromHit(hitForDoc),
+          relevance_rank: Number(src.relevance_rank ?? index + 1),
+          category_id: src.category_id ?? src.categoryId ?? hitForDoc.categoryId ?? null,
+          category_name: src.category_name ?? src.categoryName ?? hitForDoc.categoryName ?? null,
+        };
+      }
+      return src;
+    });
+
+    // Page verify only — never replace with a fresh keyword locate across all PDFs.
+    try {
+      const verified = await verifyAndCorrectSourcePages(auth, finalAnswer, question, corrected);
+      if (verified.length > 0) {
+        corrected = verified;
+      }
+    } catch {
+      // Keep corrected / upstream sources.
+    }
+    sources = finalizeSourceLinks(auth, dedupeSources(corrected));
+  }
+
+  // Only if API returned no usable citations — take the best answer-grounded hit(s).
+  if (!sources.length && hits.length > 0) {
     const scored = hits.filter((h) => {
       if (h.score < MIN_HIT_SCORE) return false;
       const text = `${h.sentence} ${h.pageText}`;
       return (
+        phraseMatchScore(text, finalAnswer) >= 0.45 ||
         phraseMatchScore(text, question) >= 0.55 ||
         topicCoverage(text, question) >= 0.6 ||
         h.score >= 0.9
@@ -615,7 +788,7 @@ export async function resolveAssistantTurn(
     if (grounded.length > 0) {
       sources = finalizeSourceLinks(
         auth,
-        grounded.map((h, index) => ({
+        grounded.slice(0, MAX_DISPLAY_SOURCES).map((h, index) => ({
           ...sourceFromHit(h),
           relevance_rank: index + 1,
         }))
@@ -636,30 +809,9 @@ export async function resolveAssistantTurn(
     }
   }
 
-  if (!sources.length) {
-    const fallback = dedupeSources(inScopeRawSources);
-    sources = await finalizeVerifiedSources(
-      auth,
-      question,
-      finalAnswer,
-      fallback,
-      scopedCategoryIds
-    );
-  }
-
-  if (!scopedCategoryIds && Array.isArray(rawSources) && rawSources.length > 0) {
-    sources = mergeAssistantSources(auth, sources, rawSources);
-  } else if (scopedCategoryIds && inScopeRawSources.length > 0) {
-    sources = mergeAssistantSources(
-      auth,
-      sources,
-      inScopeRawSources,
-      scopedCategoryIds,
-      allowedDocIds
-    );
-  }
-
   sources = filterSourcesByCategory(sources, scopedCategoryIds, allowedDocIds);
+  sources = rankAndCapSources(sources, finalAnswer, question, MAX_DISPLAY_SOURCES);
+  sources = sources.length > 0 ? finalizeSourceLinks(auth, sources) : [];
 
   // Category filter active but nothing in-scope to cite → treat as not found.
   if (scopedCategoryIds && sources.length === 0) {
@@ -964,11 +1116,16 @@ export function mergeAssistantSources(
   resolved: SourceLike[],
   raw: SourceLike[],
   categoryIds?: number[],
-  allowedDocIds?: Set<number> | null
+  allowedDocIds?: Set<number> | null,
+  answer = '',
+  question = ''
 ): SourceLike[] {
-  const merged = dedupeSources([...resolved, ...raw]);
+  // Prefer already-resolved citations; only fill gaps from raw — never dump every keyword hit.
+  const preferred = resolved.length > 0 ? resolved : raw;
+  const merged = dedupeSources(preferred);
   const scoped = filterSourcesByCategory(merged, categoryIds, allowedDocIds);
-  return scoped.length > 0 ? finalizeSourceLinks(auth, scoped) : [];
+  const capped = rankAndCapSources(scoped, answer, question, MAX_DISPLAY_SOURCES);
+  return capped.length > 0 ? finalizeSourceLinks(auth, capped) : [];
 }
 
 async function listReadyPdfDocuments(auth: string, categoryIds?: number[]): Promise<ReadyPdfDoc[]> {
@@ -1069,8 +1226,12 @@ function isBoilerplateLine(line: string): boolean {
     l.includes('uncontrolled if printed') ||
     l.includes('section revision') ||
     l.includes('revision number') ||
+    l.includes('operating manual') ||
+    l.includes('issue no') ||
     /^page\s+number\s*:/i.test(l) ||
-    /^section\s+\d+/i.test(l) ||
+    /^section\s*:?\s*\d+/i.test(l) ||
+    /^page\s+\d+\s+of\s+\d+/i.test(l) ||
+    /^(company|ship|safety|health|chemical)\s+.+\s+manual\s*$/i.test(l) ||
     /^>{1,2}\s/.test(line.trim())
   );
 }
@@ -1218,7 +1379,7 @@ function buildDetailedAnswer(
   if (!text && bestSentence) {
     text = formatAnswerBlocks([bestSentence.replace(/\s+/g, ' ').trim()]);
   }
-  text = truncateAtWord(text, DETAILED_ANSWER_MAX);
+  text = sanitizeChatAnswer(truncateAtWord(text, DETAILED_ANSWER_MAX));
   if (text && !/[.!?…]$/.test(text.trim())) text += '.';
   return text;
 }

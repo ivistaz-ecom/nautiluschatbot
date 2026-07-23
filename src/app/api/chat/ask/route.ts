@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { resolveAssistantTurn, mergeAssistantSources } from '@/lib/chat-source-attribution';
+import { resolveAssistantTurn } from '@/lib/chat-source-attribution';
 import { API_BACKEND_URL } from '@/lib/api-config';
 import {
   buildSuggestionBundle,
@@ -94,13 +94,21 @@ export async function POST(req: NextRequest) {
     body: JSON.stringify(askBody),
   });
 
-  const payload = await upstream.json();
+  let payload: Record<string, unknown>;
+  try {
+    payload = (await upstream.json()) as Record<string, unknown>;
+  } catch {
+    return NextResponse.json(
+      { success: false, message: `Upstream returned non-JSON (HTTP ${upstream.status})` },
+      { status: upstream.status || 502 }
+    );
+  }
 
   if (!upstream.ok) {
     return NextResponse.json(payload, { status: upstream.status });
   }
 
-  const data = payload?.data;
+  const data = payload?.data as Record<string, unknown> | undefined;
   if (!data || typeof data !== 'object') {
     return NextResponse.json(payload);
   }
@@ -110,14 +118,25 @@ export async function POST(req: NextRequest) {
   const isAnswered = Boolean(data.is_answered);
   const rawSources = Array.isArray(data.sources) ? data.sources : [];
 
-  const resolved = await resolveAssistantTurn(
-    auth,
-    question,
-    answer,
-    isAnswered,
-    rawSources,
-    categoryIds
-  );
+  let resolved;
+  try {
+    resolved = await resolveAssistantTurn(
+      auth,
+      question,
+      answer,
+      isAnswered,
+      rawSources,
+      categoryIds
+    );
+  } catch (err) {
+    // Prefer the PHP answer over failing the whole turn on BFF enrichment errors.
+    console.error('[chat/ask] resolveAssistantTurn failed', err);
+    resolved = {
+      answer,
+      is_answered: isAnswered,
+      sources: rawSources,
+    };
+  }
 
   // Enforce category scope: never return out-of-scope answers/sources.
   if (categoryIds) {
@@ -148,7 +167,8 @@ export async function POST(req: NextRequest) {
   } else {
     data.answer = resolved.answer;
     data.is_answered = resolved.is_answered;
-    data.sources = mergeAssistantSources(auth, resolved.sources, rawSources);
+    // Do not re-merge keyword PDF hits — resolved.sources is already ranked/capped.
+    data.sources = Array.isArray(resolved.sources) ? resolved.sources : [];
   }
 
   // Suggest alternatives when the query didn't closely match (or not found).

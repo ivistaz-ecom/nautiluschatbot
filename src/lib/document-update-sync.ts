@@ -22,11 +22,12 @@ export async function forwardDocumentUpdateToPhp(
   const base = API_BACKEND_URL.replace(/\/$/, '');
 
   // Prefer POST — many hosts reject PUT to PHP routes.
+  const root = base.replace(/\/api\/v1$/, '').replace(/\/v1$/, '');
   const attempts: { url: string; method: 'PUT' | 'POST' }[] = [
     { url: `${base}/admin/documents/${id}/update`, method: 'POST' },
     { url: `${base}/document-update.php?id=${id}`, method: 'POST' },
-    // Some hosts place standalone PHP next to /api (not under /v1).
     { url: `${base.replace(/\/v1$/, '')}/document-update.php?id=${id}`, method: 'POST' },
+    { url: `${root}/document-update.php?id=${id}`, method: 'POST' },
     { url: `${base}/admin/documents/${id}`, method: 'PUT' },
     { url: `${base}/admin/documents/${id}`, method: 'POST' },
   ];

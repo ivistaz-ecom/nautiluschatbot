@@ -1,10 +1,7 @@
 <?php
 // backend/api/v1/chat/ChatController.php
 
-require_once __DIR__ . '/../../../services/LLMService.php';
-require_once __DIR__ . '/../../../services/ChunkReranker.php';
 require_once __DIR__ . '/../../../services/DocumentParser.php';
-require_once __DIR__ . '/../../../services/SourceAttributor.php';
 require_once __DIR__ . '/../../../middleware/AuthMiddleware.php';
 require_once __DIR__ . '/../../../middleware/RateLimiter.php';
 
@@ -26,12 +23,68 @@ class ChatController {
         'explain', 'describe', 'say', 'find',
     ];
 
+    /** Common SMS words that flood FULLTEXT and drown the real ask (e.g. "authority"). */
+    private const WEAK_TOPIC_WORDS = [
+        'safety', 'management', 'system', 'systems', 'company', 'vessel', 'ship', 'ships',
+        'procedure', 'procedures', 'manual', 'document', 'documents', 'chapter', 'section',
+        'general', 'information', 'requirement', 'requirements', 'personnel', 'crew',
+        'board', 'regarding', 'related', 'within', 'according', 'including',
+    ];
+
+    /**
+     * Load chat-only services on demand so a missing file on the host
+     * does not take down auth/login (index.php loads this controller globally).
+     */
+    private function requireChatDeps(): void {
+        static $loaded = false;
+        if ($loaded) {
+            return;
+        }
+        $files = [
+            __DIR__ . '/../../../services/LLMService.php',
+            __DIR__ . '/../../../services/ChunkReranker.php',
+            __DIR__ . '/../../../services/SourceAttributor.php',
+        ];
+        foreach ($files as $file) {
+            if (!is_readable($file)) {
+                throw new RuntimeException('Missing required service file: ' . basename($file));
+            }
+            require_once $file;
+        }
+        if (!method_exists('DocumentParser', 'isTableOfContentsChunk')) {
+            throw new RuntimeException(
+                'DocumentParser.php on the server is outdated (missing isTableOfContentsChunk). '
+                . 'Upload nautilusapi/services/DocumentParser.php to public_html/services/DocumentParser.php'
+            );
+        }
+        $loaded = true;
+    }
+
     public function ask(array $params = []): void {
+        try {
+            $this->askInternal($params);
+        } catch (Throwable $e) {
+            Logger::error('chat/ask failed: ' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
+            // Always return the real cause while deploying — Hostinger logs are hard to reach.
+            $msg = $e->getMessage();
+            if ($msg === '') {
+                $msg = get_class($e) . ' in ' . basename($e->getFile()) . ':' . $e->getLine();
+            }
+            Response::error($msg, 500);
+        }
+    }
+
+    private function askInternal(array $params = []): void {
+        $this->requireChatDeps();
         $user = AuthMiddleware::require();
         $cfg  = require __DIR__ . '/../../../config/config.php';
 
+        $chatPerMinute = (int) ($cfg['rate_limit']['chat_per_minute'] ?? 10);
+        $contextChunks = (int) ($cfg['llm']['context_chunks'] ?? 8);
+        $faqThreshold  = (int) ($cfg['faq']['cache_threshold'] ?? 3);
+
         // Rate limit: 10 questions per minute per user
-        RateLimiter::check("chat:{$user['id']}", $cfg['rate_limit']['chat_per_minute'], 60);
+        RateLimiter::check("chat:{$user['id']}", $chatPerMinute, 60);
 
         $errors = Request::validate(['question' => 'required|min:3|max:2000']);
         if ($errors) {
@@ -82,9 +135,9 @@ class ChatController {
             );
         }
 
-        if ($faq && $faq['ask_count'] >= $cfg['faq']['cache_threshold'] && $faq['canonical_answer']) {
+        if ($faq && $faq['ask_count'] >= $faqThreshold && $faq['canonical_answer']) {
             // Cached answer — still attach PDF sources from retrieval so cards always render.
-            $retrieval = $this->retrieveChunks($question, $categoryIds, $cfg['llm']['context_chunks'], $documentIds);
+            $retrieval = $this->retrieveChunks($question, $categoryIds, $contextChunks, $documentIds);
             $cachedSources = SourceAttributor::ensureNonEmptySources(
                 [],
                 $retrieval['for_llm'] ?? [],
@@ -138,7 +191,7 @@ class ChatController {
         }
 
         // ── Step 3: Retrieve relevant document chunks ─────────────
-        $retrieval = $this->retrieveChunks($question, $categoryIds, $cfg['llm']['context_chunks'], $documentIds);
+        $retrieval = $this->retrieveChunks($question, $categoryIds, $contextChunks, $documentIds);
         $chunks    = $retrieval['for_llm'];
         $allChunks = $retrieval['for_fallback'];
 
@@ -183,12 +236,54 @@ class ChatController {
             $llm    = new LLMService();
             $result = $llm->answerWithFallback($question, $allChunks, $chunks);
 
-            if (!$result['answered']) {
-                $recovered = $this->recoverAnswerFromChunks($question, $chunks, $allChunks);
-                if ($recovered !== null) {
-                    $result = $recovered;
-                    Logger::info('[chat-response] recovered answer from retrieved chunk after LLM not-found');
+            // If the model answered a nearby keyword topic (e.g. responsibilities
+            // instead of authority), retry once on chunks that contain focus terms.
+            if (!empty($result['answered']) && !$this->answerAddressesQuestion($question, (string) $result['answer'])) {
+                Logger::info('[chat-response] answer missed focus terms — retrying with focused chunks');
+                $focused = $this->filterChunksByFocusTerms($chunks, $question);
+                if (empty($focused)) {
+                    $focused = $this->filterChunksByFocusTerms($allChunks, $question);
                 }
+                if (!empty($focused) && $focused !== $chunks) {
+                    $result = $llm->answerWithFallback($question, $allChunks, $focused);
+                }
+                if (!empty($result['answered']) && !$this->answerAddressesQuestion($question, (string) $result['answer'])) {
+                    Logger::info('[chat-response] focused retry still off-topic — marking unanswered');
+                    $result = [
+                        'answer'     => 'I could not find this information in the available documents.',
+                        'sources'    => [],
+                        'confidence' => 0.0,
+                        'answered'   => false,
+                    ];
+                }
+            }
+
+            // Final sanitize + answer-overlap sources (correct PDF/page for all questions).
+            if (!empty($result['answered'])) {
+                $clean = $llm->sanitizeAnswer((string) ($result['answer'] ?? ''));
+                $result['answer'] = $clean;
+                if ($clean === '' || mb_strlen($clean) < 25) {
+                    $result = [
+                        'answer'     => 'I could not find this information in the available documents.',
+                        'sources'    => [],
+                        'confidence' => 0.0,
+                        'answered'   => false,
+                    ];
+                } else {
+                    $overlap = SourceAttributor::attribute($clean, $question, $chunks);
+                    if (empty($overlap)) {
+                        $overlap = SourceAttributor::attribute($clean, $question, $allChunks);
+                    }
+                    if (!empty($overlap)) {
+                        $result['sources'] = array_slice(array_values($overlap), 0, 2);
+                    }
+                }
+            }
+
+            if (!$result['answered']) {
+                // Do not fall back to keyword-sentence extraction — that returns
+                // bloated PDF dumps instead of answering. Trust the LLM not-found.
+                Logger::info('[chat-response] LLM reported not-found; skipping recoverAnswerFromChunks');
             }
         } catch (Throwable $e) {
             Logger::error('LLM failed: ' . $e->getMessage());
@@ -208,6 +303,10 @@ class ChatController {
                 $chunks,
                 $allChunks
             );
+            // Persist the same capped set the UI will show (ask vs refresh stay aligned).
+            if (count($result['sources']) > 2) {
+                $result['sources'] = array_slice(array_values($result['sources']), 0, 2);
+            }
         } else {
             $result['sources'] = [];
         }
@@ -265,6 +364,11 @@ class ChatController {
             }
         }
 
+        // Prefer the few sources that actually back the answer — avoid 5 keyword cards.
+        if (count($sources) > 2) {
+            $sources = array_slice($sources, 0, 2);
+        }
+
         Logger::info('[chat-response] sources.length=' . count($sources)
             . ' pages=' . implode(',', array_map(
                 fn($s) => (string) ($s['pageNumber'] ?? $s['page_number'] ?? 'none'),
@@ -287,6 +391,7 @@ class ChatController {
      * page_number values match the PDF viewer (#page=N) because ingestion uses pdftotext.
      */
     public function locateSource(array $params = []): void {
+        $this->requireChatDeps();
         $user = AuthMiddleware::require();
         unset($user);
 
@@ -739,16 +844,22 @@ class ChatController {
      * @return array{for_llm: array<int, array<string, mixed>>, for_fallback: array<int, array<string, mixed>>}
      */
     private function retrieveChunks(string $question, ?array $categoryIds, int $limit, ?array $documentIds = null): array {
+        $this->requireChatDeps();
         $limit      = max(1, $limit);
         // Fetch extra candidates so reranking can promote substantive pages over TOC hits.
         $fetchLimit = min($limit * 3, 24);
         $terms      = $this->extractSearchTerms($question);
 
-        $chunks = $this->searchChunks($terms['natural'], $categoryIds, $fetchLimit, 'natural', $documentIds);
-
-        // Prefer required-term boolean (+word) so one common word cannot dominate.
-        if (empty($chunks) && ($terms['required'] ?? '') !== '') {
+        // Require distinctive terms first (e.g. "authority") so common SMS words
+        // like Master/Safety/System cannot dominate natural FULLTEXT ranking.
+        $chunks = [];
+        if (($terms['required'] ?? '') !== '') {
             $chunks = $this->searchChunks($terms['required'], $categoryIds, $fetchLimit, 'boolean', $documentIds);
+        }
+
+        $natural = $this->searchChunks($terms['natural'], $categoryIds, $fetchLimit, 'natural', $documentIds);
+        if (!empty($natural)) {
+            $chunks = $this->mergeRetrievalChunks($chunks, $natural);
         }
 
         if (empty($chunks) && $terms['boolean'] !== '') {
@@ -782,6 +893,18 @@ class ChatController {
             if (empty($chunks)) {
                 $chunks = $this->likeSearchChunks($prefixes, $categoryIds, $fetchLimit, 'or', $documentIds);
             }
+        }
+
+        // Semantic (OpenAI embeddings) alongside keyword hits.
+        $semantic = [];
+        try {
+            $semantic = $this->semanticSearchChunks($question, $categoryIds, $documentIds, $fetchLimit);
+        } catch (Throwable $e) {
+            Logger::warn('[retrieval] semantic skipped: ' . $e->getMessage());
+        }
+        if (!empty($semantic)) {
+            Logger::info('[retrieval] semantic hits=' . count($semantic));
+            $chunks = $this->mergeRetrievalChunks($chunks, $semantic);
         }
 
         $chunks = $this->filterUsefulChunks($chunks);
@@ -866,6 +989,162 @@ class ChatController {
         return implode("\n", $lines) . "\n";
     }
 
+    /**
+     * Merge keyword + semantic hits by chunk identity; keep best scores.
+     *
+     * @param array<int, array<string, mixed>> $keyword
+     * @param array<int, array<string, mixed>> $semantic
+     * @return array<int, array<string, mixed>>
+     */
+    private function mergeRetrievalChunks(array $keyword, array $semantic): array {
+        $byKey = [];
+        foreach (array_merge($keyword, $semantic) as $chunk) {
+            $key = ((int) ($chunk['document_id'] ?? 0)) . ':'
+                . ((int) ($chunk['page_number'] ?? 0)) . ':'
+                . ((int) ($chunk['chunk_index'] ?? 0));
+            if ($key === '0:0:0' && !empty($chunk['id'])) {
+                $key = 'id:' . (int) $chunk['id'];
+            }
+            if (!isset($byKey[$key])) {
+                $byKey[$key] = $chunk;
+                continue;
+            }
+            $prev = $byKey[$key];
+            $byKey[$key] = array_merge($prev, $chunk);
+            $byKey[$key]['score'] = max(
+                (float) ($prev['score'] ?? 0),
+                (float) ($chunk['score'] ?? 0)
+            );
+            $byKey[$key]['semantic_score'] = max(
+                (float) ($prev['semantic_score'] ?? 0),
+                (float) ($chunk['semantic_score'] ?? 0)
+            );
+        }
+        return array_values($byKey);
+    }
+
+    /**
+     * Rank embedded chunks by cosine similarity to the question embedding.
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    private function semanticSearchChunks(
+        string $question,
+        ?array $categoryIds,
+        ?array $documentIds,
+        int $limit
+    ): array {
+        try {
+            require_once __DIR__ . '/../../../services/EmbeddingService.php';
+            if (!class_exists('EmbeddingService', false)) {
+                return [];
+            }
+            $embedder = new EmbeddingService();
+        } catch (Throwable $e) {
+            Logger::warn('[retrieval] EmbeddingService unavailable: ' . $e->getMessage());
+            return [];
+        }
+        if (!$embedder->isEnabled()) {
+            return [];
+        }
+
+        // Confirm column exists BEFORE calling OpenAI (avoids wasted API + clearer logs).
+        try {
+            $probe = Database::queryOne(
+                "SELECT COUNT(*) AS c FROM information_schema.COLUMNS
+                 WHERE TABLE_SCHEMA = DATABASE()
+                   AND TABLE_NAME = 'document_chunks'
+                   AND COLUMN_NAME = 'embedding'"
+            );
+            if ((int) ($probe['c'] ?? 0) === 0) {
+                Logger::warn('[retrieval] embedding column missing — run migrations/001_chunk_embeddings.sql');
+                return [];
+            }
+        } catch (Throwable $e) {
+            Logger::warn('[retrieval] embedding column probe failed: ' . $e->getMessage());
+            return [];
+        }
+
+        $qVec = $embedder->embed($question);
+        if ($qVec === null) {
+            return [];
+        }
+
+        [$categorySql, $categoryBinds] = $this->categoryFilterSql($categoryIds, $documentIds);
+
+        // Score in batches so Hostinger does not OOM loading ~7k JSON vectors at once.
+        $batchSize = 150;
+        $offset    = 0;
+        $scored    = [];
+        $keepN     = max(1, $limit);
+
+        while (true) {
+            $sql = "SELECT dc.id, dc.document_id, dc.page_number, dc.chunk_index, dc.content, dc.embedding,
+                           d.title, d.mime_type, d.category_id, c.name AS category_name
+                    FROM document_chunks dc
+                    JOIN documents d ON d.id = dc.document_id AND d.status = 'ready'
+                    JOIN categories c ON c.id = d.category_id
+                    WHERE dc.embedding IS NOT NULL
+                      AND d.category_id IS NOT NULL
+                      $categorySql
+                    ORDER BY dc.id ASC
+                    LIMIT " . (int) $batchSize . " OFFSET " . (int) $offset;
+
+            try {
+                $rows = Database::query($sql, $categoryBinds);
+            } catch (Throwable $e) {
+                Logger::warn('[retrieval] semantic query failed: ' . $e->getMessage());
+                break;
+            }
+
+            if (empty($rows)) {
+                break;
+            }
+
+            foreach ($rows as $row) {
+                $raw = $row['embedding'] ?? null;
+                if (is_string($raw)) {
+                    $vec = json_decode($raw, true);
+                } elseif (is_array($raw)) {
+                    $vec = $raw;
+                } else {
+                    continue;
+                }
+                if (!is_array($vec) || empty($vec)) {
+                    continue;
+                }
+                $sim = EmbeddingService::cosineUnit($qVec, $vec);
+                if ($sim < 0.42) {
+                    continue;
+                }
+                unset($row['embedding']);
+                $row['semantic_score'] = $sim;
+                $row['score'] = max(0.05, $sim * 2.5);
+                $scored[] = $row;
+            }
+
+            // Keep only the best candidates so memory stays bounded across batches.
+            if (count($scored) > $keepN * 3) {
+                usort($scored, fn($a, $b) => ($b['semantic_score'] ?? 0) <=> ($a['semantic_score'] ?? 0));
+                $scored = array_slice($scored, 0, $keepN * 3);
+            }
+
+            if (count($rows) < $batchSize) {
+                break;
+            }
+            $offset += $batchSize;
+
+            // Safety cap: do not scan more than ~6k rows per request on shared hosting.
+            if ($offset >= 6000) {
+                Logger::warn('[retrieval] semantic scan capped at 6000 rows');
+                break;
+            }
+        }
+
+        usort($scored, fn($a, $b) => ($b['semantic_score'] ?? 0) <=> ($a['semantic_score'] ?? 0));
+        return array_slice($scored, 0, $keepN);
+    }
+
     private function filterUsefulChunks(array $chunks): array {
         return array_values(array_filter($chunks, fn($c) => $this->isUsefulChunk($c['content'] ?? '')));
     }
@@ -904,9 +1183,30 @@ class ChatController {
         }
 
         $significant = array_values(array_unique($significant));
-        $top         = array_slice($significant, 0, 12);
-        // Require the strongest topic words so one generic term cannot flood results.
-        $requiredWords = array_slice($top, 0, min(4, max(2, count($top))));
+
+        // Put distinctive ask-words first (authority, inspection, …) ahead of weak SMS nouns.
+        $focus = [];
+        $anchors = [];
+        foreach ($significant as $word) {
+            if (in_array($word, self::WEAK_TOPIC_WORDS, true)) {
+                $anchors[] = $word;
+            } else {
+                $focus[] = $word;
+            }
+        }
+        usort($focus, fn($a, $b) => strlen($b) <=> strlen($a));
+
+        $ordered = array_values(array_unique(array_merge($focus, $anchors)));
+        $top     = array_slice($ordered, 0, 12);
+
+        // Required boolean: distinctive terms must appear; add at most one weak anchor.
+        $requiredWords = array_slice($focus, 0, min(3, max(1, count($focus))));
+        if (count($requiredWords) < 2 && !empty($anchors)) {
+            $requiredWords[] = $anchors[0];
+        }
+        if (count($requiredWords) < 2 && count($top) >= 2) {
+            $requiredWords = array_slice($top, 0, 2);
+        }
 
         return [
             'natural'  => implode(' ', $top),
@@ -914,13 +1214,10 @@ class ChatController {
                 fn($w) => strlen($w) >= 3 ? $w . '*' : $w,
                 $top
             )),
-            // Required boolean: each significant word must appear (+term*).
             'required' => implode(' ', array_map(
                 fn($w) => strlen($w) >= 3 ? '+' . $w . '*' : '+' . $w,
                 $requiredWords
             )),
-            // Typo-tolerant boolean pass: prefix wildcards so a misspelled
-            // ending ("proceduer") still matches the indexed word ("procedure").
             'fuzzy'    => implode(' ', array_map(
                 fn($w) => strlen($w) >= 6
                     ? substr($w, 0, max(4, strlen($w) - 3)) . '*'
@@ -928,6 +1225,7 @@ class ChatController {
                 $top
             )),
             'keywords' => array_slice($top, 0, 5),
+            'focus'    => $focus,
         ];
     }
 
@@ -1110,6 +1408,113 @@ class ChatController {
             $tokens[] = $w;
         }
         return array_values(array_unique($tokens));
+    }
+
+    /**
+     * Distinctive ask-words from the question (excludes weak SMS nouns).
+     *
+     * @return array<int, string>
+     */
+    private function focusTermsFromQuestion(string $question): array {
+        $terms = $this->extractSearchTerms($question);
+        $focus = $terms['focus'] ?? [];
+        if (!empty($focus)) {
+            return array_values(array_slice($focus, 0, 4));
+        }
+        // Fall back to significant tokens minus weak words.
+        $out = [];
+        foreach ($this->significantQuestionTokens($question) as $t) {
+            if (!in_array($t, self::WEAK_TOPIC_WORDS, true)) {
+                $out[] = $t;
+            }
+        }
+        return array_values(array_slice($out, 0, 4));
+    }
+
+    /** @return array<int, string> */
+    private function termVariants(string $term): array {
+        $t = mb_strtolower($term);
+        $variants = [$t];
+        if (str_ends_with($t, 'y') && mb_strlen($t) > 3) {
+            $variants[] = mb_substr($t, 0, -1) . 'ies';
+        }
+        if (str_ends_with($t, 's') && mb_strlen($t) > 3) {
+            $variants[] = mb_substr($t, 0, -1);
+        } else {
+            $variants[] = $t . 's';
+        }
+
+        // Common SMS / legal near-synonyms for grounding checks.
+        $syn = [
+            'authority'   => ['authority', 'authorities', 'authorised', 'authorized', 'overriding', 'discretion', 'powers', 'power'],
+            'authorities' => ['authority', 'authorities', 'authorised', 'authorized', 'overriding'],
+            'responsibility' => ['responsibility', 'responsibilities', 'responsible', 'accountable'],
+            'inspection'  => ['inspection', 'inspections', 'inspect', 'inspected'],
+            'emergency'   => ['emergency', 'emergencies'],
+        ];
+        if (isset($syn[$t])) {
+            $variants = array_merge($variants, $syn[$t]);
+        }
+
+        return array_values(array_unique($variants));
+    }
+
+    /**
+     * True when the answer appears to address the distinctive ask (not just shared keywords).
+     */
+    private function answerAddressesQuestion(string $question, string $answer): bool {
+        $focus = $this->focusTermsFromQuestion($question);
+        if (empty($focus)) {
+            return true;
+        }
+
+        $lower = mb_strtolower($answer);
+        $hits  = 0;
+        foreach ($focus as $term) {
+            foreach ($this->termVariants($term) as $variant) {
+                if ($variant !== '' && str_contains($lower, $variant)) {
+                    $hits++;
+                    break;
+                }
+            }
+        }
+
+        // Require at least half of focus terms (minimum 1) to appear in the answer.
+        $need = max(1, (int) ceil(count($focus) * 0.5));
+        return $hits >= $need;
+    }
+
+    /**
+     * Keep chunks that contain at least one distinctive focus term (or a synonym).
+     *
+     * @param  array<int, array<string, mixed>> $chunks
+     * @return array<int, array<string, mixed>>
+     */
+    private function filterChunksByFocusTerms(array $chunks, string $question): array {
+        $focus = $this->focusTermsFromQuestion($question);
+        if (empty($focus) || empty($chunks)) {
+            return $chunks;
+        }
+
+        $filtered = [];
+        foreach ($chunks as $chunk) {
+            $lower = mb_strtolower((string) ($chunk['content'] ?? ''));
+            foreach ($focus as $term) {
+                $matched = false;
+                foreach ($this->termVariants($term) as $variant) {
+                    if ($variant !== '' && str_contains($lower, $variant)) {
+                        $matched = true;
+                        break;
+                    }
+                }
+                if ($matched) {
+                    $filtered[] = $chunk;
+                    break;
+                }
+            }
+        }
+
+        return $filtered;
     }
 
     /**

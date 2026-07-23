@@ -38,11 +38,38 @@ class ChunkReranker {
             return $chunks;
         }
 
-        $filtered = array_values(array_filter($chunks, function ($chunk) use ($question) {
+        $weak = [
+            'safety', 'management', 'system', 'systems', 'company', 'vessel', 'ship', 'ships',
+            'procedure', 'procedures', 'manual', 'document', 'documents', 'chapter', 'section',
+            'general', 'information', 'requirement', 'requirements', 'personnel', 'crew', 'board',
+        ];
+        $focus = array_values(array_filter(
+            $terms,
+            fn($t) => !in_array($t, $weak, true)
+        ));
+
+        $filtered = array_values(array_filter($chunks, function ($chunk) use ($question, $focus) {
             $phrase = (float) ($chunk['phrase_score'] ?? self::phraseMatchScore($chunk['content'] ?? '', $question));
             $cover  = (float) ($chunk['coverage'] ?? self::topicCoverage($chunk['content'] ?? '', $question));
-            // Keep strong phrase hits, or pages covering most topic words.
-            return $phrase >= 0.55 || $cover >= 0.6;
+            $sem    = (float) ($chunk['semantic_score'] ?? 0);
+
+            // Must contain at least one distinctive ask-word when we have them.
+            if (!empty($focus)) {
+                $lower = mb_strtolower((string) ($chunk['content'] ?? ''));
+                $hasFocus = false;
+                foreach ($focus as $term) {
+                    if (str_contains($lower, $term) || str_contains($lower, rtrim($term, 's'))) {
+                        $hasFocus = true;
+                        break;
+                    }
+                }
+                if (!$hasFocus && $sem < 0.68) {
+                    return false;
+                }
+            }
+
+            // Keep strong phrase hits, solid topic coverage, or strong semantic matches.
+            return $phrase >= 0.55 || $cover >= 0.6 || $sem >= 0.62;
         }));
 
         // Never wipe the whole set — keep top-ranked originals if filter is too strict.
@@ -50,7 +77,7 @@ class ChunkReranker {
     }
 
     /**
-     * Combine the DB FULLTEXT score with content-quality + topic signals.
+     * Combine the DB FULLTEXT score with semantic + content-quality + topic signals.
      */
     public function computeScore(array $chunk, string $question): float {
         $content = $chunk['content'] ?? '';
@@ -72,8 +99,36 @@ class ChunkReranker {
         $base *= 1.0 + ($phrase * 1.8);
         $base *= 0.55 + ($cover * 0.9);
 
-        // Penalise pages that only hit one generic word.
-        if ($phrase < 0.4 && $cover < 0.5) {
+        // Extra boost when distinctive question terms (non-generic) appear in the chunk.
+        $qTerms = $this->significantTerms($question);
+        $weak = [
+            'safety', 'management', 'system', 'systems', 'company', 'vessel', 'ship', 'ships',
+            'procedure', 'procedures', 'manual', 'document', 'documents',
+        ];
+        $focus = array_values(array_filter($qTerms, fn($t) => !in_array($t, $weak, true)));
+        if (!empty($focus)) {
+            $contentLower = mb_strtolower($content);
+            $focusHits = 0;
+            foreach ($focus as $term) {
+                if (str_contains($contentLower, $term) || str_contains($contentLower, rtrim($term, 's'))) {
+                    $focusHits++;
+                }
+            }
+            if ($focusHits === 0) {
+                $base *= 0.25;
+            } else {
+                $base *= 1.0 + (0.55 * ($focusHits / count($focus)));
+            }
+        }
+
+        // Semantic cosine (0–1) from OpenAI embeddings — lifts paraphrased matches.
+        $semantic = (float) ($chunk['semantic_score'] ?? 0);
+        if ($semantic > 0) {
+            $base *= 0.45 + ($semantic * 1.8);
+        }
+
+        // Penalise pages that only hit one generic word and have weak semantics.
+        if ($phrase < 0.4 && $cover < 0.5 && $semantic < 0.55) {
             $base *= 0.35;
         }
 

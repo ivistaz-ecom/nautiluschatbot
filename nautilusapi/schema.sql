@@ -121,6 +121,9 @@ CREATE TABLE `document_chunks` (
   `page_number` int(11) NOT NULL,
   `chunk_index` int(11) NOT NULL DEFAULT 0,
   `content` mediumtext NOT NULL,
+  `embedding` JSON DEFAULT NULL,
+  `embedding_model` VARCHAR(64) DEFAULT NULL,
+  `embedded_at` TIMESTAMP NULL DEFAULT NULL,
   `created_at` timestamp NOT NULL DEFAULT current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
